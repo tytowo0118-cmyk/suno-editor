@@ -1,0 +1,81 @@
+name: museblocks
+
+services:
+  backend:
+    build:
+      context: ./backend
+    container_name: museblocks-backend
+    init: true
+    ports:
+      - "8000:8000"
+    volumes:
+      # 源码热更新；同时让锁定音频与成品 WAV 留在宿主机上
+      - ./backend:/app
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      # Suno 代理：在根目录 .env 里配置 SUNO_API_BASE 与 SUNO_API_KEY
+      SUNO_API_BASE: ${SUNO_API_BASE:-}
+      SUNO_API_KEY: ${SUNO_API_KEY:-}
+      SUNO_MODEL: ${SUNO_MODEL:-}
+      SUNO_POLL_INTERVAL: ${SUNO_POLL_INTERVAL:-5}
+      SUNO_TIMEOUT: ${SUNO_TIMEOUT:-300}
+      # 歌词 LLM：OpenAI 兼容 /chat/completions；LLM_API_KEY 缺省时复用 SUNO_API_KEY
+      LLM_API_BASE: ${LLM_API_BASE:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+    command: >
+      uvicorn main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload --reload-dir /app
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: museblocks-frontend
+    init: true
+    ports:
+      - "3000:3000"
+    environment:
+      # 浏览器侧访问后端的地址；局域网访问时改成宿主机的 IP
+      NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://127.0.0.1:8000}
+      # 局域网访问前端时补充允许的 Origin（逗号分隔），避免 Next 拦截 HMR 资源
+      ALLOWED_DEV_ORIGINS: ${ALLOWED_DEV_ORIGINS:-}
+      NEXT_TELEMETRY_DISABLED: "1"
+    volumes:
+      - ./frontend:/app
+      # 依赖和构建缓存放在命名卷里，避免被宿主机目录覆盖
+      - frontend_node_modules:/app/node_modules
+      - frontend_next:/app/.next
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+volumes:
+  frontend_node_modules:
+  frontend_next:

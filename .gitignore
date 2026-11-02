@@ -1,0 +1,18 @@
+# dependencies
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# next
+.next/
+out/
+
+# env
+.env
+.env.local
+
+# runtime artifacts
+backend/static/output/*.wav
+backend/static/generated/*.wav
+.DS_Store

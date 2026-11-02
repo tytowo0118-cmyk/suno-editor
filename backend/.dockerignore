@@ -1,0 +1,10 @@
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+*.log
+
+# 运行时生成的音频不入镜像
+static/output
+
+.DS_Store
