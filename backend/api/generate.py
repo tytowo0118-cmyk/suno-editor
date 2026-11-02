@@ -22,6 +22,7 @@ import re
 import time
 import urllib.parse
 import uuid
+import wave
 from pathlib import Path
 from typing import Any, Optional
 
@@ -32,6 +33,21 @@ from fastapi.responses import FileResponse
 from utils.audio_processor import STATIC_DIR
 
 logger = logging.getLogger(__name__)
+
+# SUNO_VERBOSE_LOG=1 时把上游请求体/响应原文打到日志，用于联调扣费类接口时留痕
+VERBOSE_LOG = os.environ.get("SUNO_VERBOSE_LOG", "").strip().lower() in {"1", "true", "yes"}
+UPSTREAM_LOG_LIMIT = 3000
+
+
+def _log_upstream(label: str, response: httpx.Response) -> None:
+    if not VERBOSE_LOG:
+        return
+    logger.info(
+        "suno upstream %s: HTTP %s body=%s",
+        label,
+        response.status_code,
+        response.text[:UPSTREAM_LOG_LIMIT],
+    )
 
 router = APIRouter(prefix="/api", tags=["generation"])
 
@@ -235,10 +251,18 @@ async def _submit(
         if continue_at is not None:
             payload["continue_at"] = round(continue_at, 3)
 
+    if VERBOSE_LOG:
+        logger.info(
+            "suno submit payload: %s",
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        )
+
     try:
         response = await client.post(f"{base}/suno/submit/music", headers=headers, json=payload)
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"无法连接 Suno 代理：{exc}") from exc
+
+    _log_upstream("submit", response)
 
     if response.status_code >= 400:
         detail = _upstream_message(response.text) or f"HTTP {response.status_code}"
@@ -275,6 +299,8 @@ async def _wait_for_audio(
             response = await client.get(url, headers=headers)
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"轮询 Suno 失败：{exc}") from exc
+
+        _log_upstream(f"fetch {task_id}", response)
 
         if response.status_code >= 400:
             detail = _upstream_message(response.text) or f"HTTP {response.status_code}"
@@ -420,6 +446,23 @@ async def generate_music(
             await _to_wav(source, target)
         finally:
             source.unlink(missing_ok=True)
+
+        with wave.open(str(target), "rb") as handle:
+            frames, frame_rate, channels, sample_width = (
+                handle.getnframes(),
+                handle.getframerate(),
+                handle.getnchannels(),
+                handle.getsampwidth(),
+            )
+        logger.info(
+            "suno wav written: %s start=0.000s duration=%.3fs frames=%d rate=%d ch=%d bits=%d",
+            target.name,
+            frames / float(frame_rate),
+            frames,
+            frame_rate,
+            channels,
+            sample_width * 8,
+        )
 
     return FileResponse(
         target,

@@ -300,10 +300,21 @@ def stitch_sequence(
             max_crossfade = max(0, min(mixed.shape[0], current.shape[0]) - 1)
             requested = int(max(0, pending_crossfade) * frame_rate / 1000.0)
             applied = min(requested, max_crossfade)
+            prev_end = mixed.shape[0]
             # 淡化区是两段共用的样本，所以本段起点要往前挪一个重叠长度
-            segment_starts.append((mixed.shape[0] - applied) / float(frame_rate))
+            segment_starts.append((prev_end - applied) / float(frame_rate))
             mixed = _crossfade(mixed, current, applied)
-            logger.info("stitch step %d: crossfade=%d samples", index, applied)
+            logger.info(
+                "stitch step %d junction audit: prev_end=%.3fms overlap=%.3fms "
+                "segment_start=%.3fms next_len=%.3fms samples=%d/%d",
+                index,
+                prev_end * 1000.0 / frame_rate,
+                applied * 1000.0 / frame_rate,
+                segment_starts[-1] * 1000.0,
+                current.shape[0] * 1000.0 / frame_rate,
+                applied,
+                max_crossfade,
+            )
             pending_crossfade = crossfade_to_next
 
         if mixed is None or mixed.size == 0:
@@ -318,6 +329,13 @@ def stitch_sequence(
         duration = mixed.shape[0] / float(frame_rate)
         peak = float(np.max(np.abs(mixed))) if mixed.size else 0.0
         peak_dbfs_actual = 20.0 * np.log10(peak) if peak > 0 else -120.0
+        logger.info(
+            "stitch done: frames=%d rate=%d duration=%.3fs segment_start_ms=%s",
+            mixed.shape[0],
+            frame_rate,
+            duration,
+            [round(start * 1000.0, 3) for start in segment_starts],
+        )
         return str(path), duration, float(peak_dbfs_actual), segment_starts
     finally:
         for temp in temps:

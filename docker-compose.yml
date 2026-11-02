@@ -20,6 +20,8 @@ services:
       SUNO_MODEL: ${SUNO_MODEL:-}
       SUNO_POLL_INTERVAL: ${SUNO_POLL_INTERVAL:-5}
       SUNO_TIMEOUT: ${SUNO_TIMEOUT:-300}
+      # 联调留痕：置 1 时把提交 Payload 与上游原始响应打进后端日志（不含密钥）
+      SUNO_VERBOSE_LOG: ${SUNO_VERBOSE_LOG:-0}
       # 歌词 LLM：OpenAI 兼容 /chat/completions；LLM_API_KEY 缺省时复用 SUNO_API_KEY
       LLM_API_BASE: ${LLM_API_BASE:-}
       LLM_API_KEY: ${LLM_API_KEY:-}

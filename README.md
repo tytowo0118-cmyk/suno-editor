@@ -269,6 +269,7 @@ curl -X POST http://127.0.0.1:8000/api/generate \
 | `SUNO_MODEL` | 否 | — | 需要指定模型版本时追加到提交 Payload |
 | `SUNO_POLL_INTERVAL` | 否 | `5` | 轮询间隔（秒，可为小数），测试时可调小 |
 | `SUNO_TIMEOUT` | 否 | `300` | 单次生成最长等待（秒） |
+| `SUNO_VERBOSE_LOG` | 否 | `0` | 置 `1` 时把提交 Payload 与上游原始响应（HTTP 状态码 + JSON）打进后端日志，用于扣费接口联调留痕；不打印任何密钥 |
 | `FFMPEG_BINARY` | 否 | imageio-ffmpeg 内置 | 自定义 ffmpeg 可执行文件路径 |
 
 错误处理：未配置 `SUNO_API_KEY` 返回 500（`未配置 SUNO_API_KEY，請檢查後端環境變數。`），
