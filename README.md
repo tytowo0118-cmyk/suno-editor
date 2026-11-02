@@ -9,8 +9,8 @@
 FastAPI 的 `POST /api/generate`（只传 `prompt`，由后端转发 Suno），拿到整段带人声的 WAV 后
 转为 Blob 播放；每段音频按返回的自然时长在时间轴上自适应展开，不再截断或拉伸到预估秒数。
 锁定 Take 时把音频上传到后端落盘，最终以 8 ms 微淡入淡出（近似硬切）拼接，避免人声重影。
-成品波形可点选任意时间点，后端按 Suno 的 `continue_clip_id` / `continue_at` 从该点续写出一版新候选，
-试听满意再替换锁定。
+成品波形可点选任意时间点，后端按 Suno 的 `continue_clip_id` / `continue_at` 从该点续写，
+一次任务的两个双生片段都挂为该段的新候选，试听满意再替换锁定。
 后端通过 `SUNO_API_BASE` / `SUNO_API_KEY` 调用真实 Suno 代理，未配置密钥时直接报错并提示；
 歌词由 `/api/lyrics` 调用 OpenAI 兼容的 `/chat/completions` 实时生成（`LLM_MODEL` 默认
 `gpt-4o-mini`），未配置 LLM 时回退本地模板，保证演示可用。
@@ -27,6 +27,7 @@ FastAPI 的 `POST /api/generate`（只传 `prompt`，由后端转发 Suno），�
 │    ├─ SongBriefPanel.tsx 第一页：提示词 + 歌词 + AI 生成 + 分段实时预览       │
 │    ├─ Timeline.tsx       第二页：点击色块切换下方唯一生成框；dnd-kit 拖拽重排 │
 │    ├─ TakeCard.tsx       3 个候选卡片（试听 + 锁定，锁定后自动切下一段）      │
+│    ├─ WaveformExtendPlayer.tsx 成品波形取点与 continue_at 续写提交            │
 │    └─ WaveformPlayer.tsx wavesurfer.js 波形；模块级单实例播放协调              │
 │                                                                    │
 │  lib/lyrics.ts     歌词标签解析 → 段落 / 时长 / 提示词组装          │
@@ -195,9 +196,15 @@ curl -X POST http://127.0.0.1:8000/api/lyrics \
 | `duration` | 整数秒，**占位字段**；后端不再强依赖，实际时长由歌词决定 |
 | `continue_clip_id` | string，选填；上游片段 ID，非空时本次请求走**续写**（`metadata.task: "extend"`） |
 | `continue_at` | 浮点秒，选填（0–600）；续写起点，必须与 `continue_clip_id` 一起使用 |
-| 响应 | `audio/wav` 整段音频，无 JSON 包装；响应头 `X-Suno-Task-Id`、`X-Suno-Clip-Id` 回传本次音频的 ID |
+| `max_clips` | 整数，选填（默认 1，上限 2）；一次任务上游固定产出 2 个片段，取 2 时把第 2 个一并下载回传 |
+| 响应 | `audio/wav` 整段音频，无 JSON 包装；响应头 `X-Suno-Task-Id`、`X-Suno-Clip-Id` 回传本次音频的 ID，`X-Suno-Extra-Clips` 回传其余片段（base64 编码的 JSON 数组） |
 
 - **初次生成不携带续写参数**：段落候选各自独立，段与段之间没有音频上下文；拼接只发生在最后一步。
+- **双生片段**：上游每个任务实际返回 `data[0]` 与 `data[1]` 两条片段，只取其一等于浪费一半额度。
+  `max_clips=2` 时后端把两条都下载转码，第一条作为响应体，其余以
+  `X-Suno-Extra-Clips: base64([{"clipId","url","duration"}])` 回传（`url` 指向 `static/output/` 下的 WAV）；
+  前端遍历数组，把它们挂为同一段落的独立子分支。三个自定义头都必须在 CORS
+  `expose_headers` 里声明，否则跨端读取为空、续写与双生挂载会静默失效。
 - **续写（可选）**：把某个已生成 clip 在 `continue_at` 秒之前的音频交给上游作为创作上下文，
   返回一段以此为基础**重新生成**的续写音频。实测结果**不包含**原开头（与源音频前段的波形相关系数
   接近 0），因此它是「这个点的另一版延续」而不是原片段的延长版，前端把它作为该段的**新候选**追加，
@@ -211,6 +218,8 @@ curl -X POST http://127.0.0.1:8000/api/lyrics \
   随之自适应，不做任何截断/拉伸。锁定候选时以该候选的真实时长再次校准。
 - **3 选 1**：每段并发 3 次请求得到 3 个候选；任一失败则整体失败并回收已生成的 Blob URL。
   页面不会自动生成，需点击「生成候选」，避免误耗云端额度。
+  批量候选保持 `max_clips=1`（每个任务只留第一条），以免同一任务的两条片段把「3 选 1」撑成 6 选 1；
+  只有续写路径请求双生片段。
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/generate \
@@ -236,8 +245,10 @@ curl -X POST http://127.0.0.1:8000/api/generate \
 把灯留给未归的人" \
   -F "continue_clip_id=clip-4" \
   -F "continue_at=10.000" \
+  -F "max_clips=2" \
   -o continue.wav
 # 响应头 X-Suno-Clip-Id 给出这一版音频的片段 ID，可用于下一次续写
+# 第 2 条片段在 X-Suno-Extra-Clips 里，解码：grep -i x-suno-extra-clips /tmp/head.txt | awk '{print $2}' | base64 -d
 ```
 
 后端实现（`backend/api/generate.py`）：
@@ -250,17 +261,21 @@ curl -X POST http://127.0.0.1:8000/api/generate \
    携带续写参数时再追加 `continue_clip_id` 与 `continue_at`（秒，保留 3 位小数）。
    `continue_clip_id` 只允许 `[A-Za-z0-9_-]{1,64}`，否则返回 422。
 3. **轮询**：每 `SUNO_POLL_INTERVAL` 秒（默认 5）请求 `GET {SUNO_API_BASE}/suno/fetch/{task_id}`，
-   直到 `status` 为 `COMPLETE` / `SUCCESS` 并拿到 `audio_url`；`FAILED` / `ERROR` 立即失败，
-   超过 `SUNO_TIMEOUT`（默认 300s）返回 504。
+   直到 `status` 为 `COMPLETE` / `SUCCESS` 并拿到落定片段的 `audio_url`；`FAILED` / `ERROR` 立即失败，
+   超过 `SUNO_TIMEOUT`（默认 300s）返回 504。解析函数 `_fetch_state` 返回
+   `(status, 片段列表, 失败信息)`，片段列表按上游顺序保留**全部**已产出成品地址的片段，
+   调用方按 `max_clips` 截取，不再只读 `data[0]`。
 4. **兼容网关响应包**：第三方网关的业务码并不统一，成功形态可能是
    `{"code": 200, "data": {"task_id": "..."}}`，也可能是 `{"code": "success", "data": "task_xxx"}`
    （`data` 直接是任务 ID 字符串）；轮询结果里的片段还嵌了一层 `data.data[]`，其中
    `status: "streaming"` 阶段的 `audio_url` 是流地址、不能直接下载，因此只接受片段状态落定后的地址。
    `code` 不在成功集合内时按业务错误处理并透出上游 `message`。
 5. **片段 ID 透出**：轮询结果里每个片段自带 `clip_id`，落定后连同音频地址一起返回；
-   接口把它写进响应头 `X-Suno-Clip-Id`，前端保存后可作为下一次续写的 `continue_clip_id`。
-6. **下载与转码**：用 httpx 下载上游音频到 `static/output/`，再用 ffmpeg 统一转成
-   44.1 kHz / 立体声 / 16-bit WAV，最后 `FileResponse(media_type="audio/wav")` 返回给前端。
+   接口把第一条写进响应头 `X-Suno-Clip-Id`，其余序列化成 base64 JSON 放进 `X-Suno-Extra-Clips`，
+   前端保存后可作为下一次续写的 `continue_clip_id`。
+6. **下载与转码**：用 httpx 逐条下载上游音频到 `static/output/`，再用 ffmpeg 统一转成
+   44.1 kHz / 立体声 / 16-bit WAV（文件名 `suno_<ts>_<rand>.wav`、`suno_<ts>_<rand>_1.wav` …），
+   最后 `FileResponse(media_type="audio/wav")` 返回第一条；任一后续片段失败时回收已写盘的文件。
 
 | 环境变量 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- |
@@ -283,8 +298,10 @@ curl -X POST http://127.0.0.1:8000/api/generate \
 2. 后端不可达时提示检查 FastAPI 与 Suno 代理是否已启动。
 3. 生成失败会同时写入当前段的错误面板和底部 Toast（包括未配置 Key 的 500）。
 4. 生成结果只存在于内存，锁定后才落盘（见 2.4）。
-5. 每个候选保存 `X-Suno-Clip-Id` 返回的 `clipId`（`Take.clipId`）；`continueTake()` 用它发起
-   单次续写，结果以「Take 续写」标签追加为该段的新候选，不覆盖已锁定的音频。
+5. 每个候选保存 `X-Suno-Clip-Id` 返回的 `clipId`（`Take.clipId`）；`continueTakes()` 用它发起续写，
+   并带上 `max_clips=2`，遍历 `X-Suno-Extra-Clips` 解码出的数组把每条残值片段下载成 Blob 后
+   以「续写分支 A / B」标签追加为该段的独立子分支（卡片序号沿用「候选项 04 / 05」，都停在待选择），不覆盖已锁定的音频；
+   残值片段下载失败只少一个候选，不会作废整次续写。
 
 ### 2.4 `POST /api/assets` — 候选落盘
 
@@ -339,14 +356,18 @@ curl -X POST http://127.0.0.1:8000/api/assets \
   "sample_rate": 44100,
   "crossfade_ms": [8, 8, 8],
   "segment_order": ["intro-1", "verse-1", "chorus-1"],
-  "segment_start_sec": [0, 35.224, 55.416]
+  "segment_start_sec": [0, 35.224, 55.416],
+  "head_trim_sec": [0, 0.007, 0.283]
 }
 ```
 
-- `duration` 为实际成品时长：`Σ 各段时长 − Σ 交叉淡化重叠`。
+- `duration` 为实际成品时长：`Σ 各段时长 − Σ 头部剔除 − Σ 交叉淡化重叠`。
 - `segment_start_sec` 与 `segment_order` 一一对应，给出每段在成品时间轴上的起点（秒，保留 3 位）。
   淡化区是两段共用的样本，所以起点会往前挪一个重叠长度（首段 0，其后 `已混长度 − 重叠采样 / 采样率`）；
   前端 `locateMixSegment()` 用它把「全曲时间点」映射回「段落 + 段内偏移」。
+- `head_trim_sec` 给出每段拼接时被物理剔除的头部静音（首段恒为 0）。段内偏移要换算回源片段
+  自己的时间轴（续写用的 `continue_at` 指的是原始 clip），必须把这段垫片加回去，
+  因此 `locateMixSegment()` 计算 `全曲时间 − 段起点 + 该段 head_trim`。
 - 错误映射：非法音频源 400、文件不存在 404、其他 500、`output_name` 非法 422。
 
 ### 2.6 其他端点
@@ -386,13 +407,22 @@ ffmpeg -y -i source.mp3 -ar 44100 -ac 2 -c:a pcm_s16le output.wav
    ```
    当前前端固定传 `crossfade_ms = 8`，重叠区只有约 350 个采样点，听感上是硬切，
    既保留算法兼容性，又避免 Suno 成品人声在长交叉区里出现重影。
-3. **防爆音**：
+3. **首部静音绝对裁切**（`_trim_head_silence`）：Suno 续写出来的音频头部带约 270 ms 数字静音，
+   直接进交叉淡化会让拼接点前面出现一段听感真空。拼接循环在处理**非首段**时先按帧取声道最大绝对值，
+   找到第一个达到阈值（默认 `HEAD_TRIM_THRESHOLD_DBFS = -50`，即幅度 0.00316）的帧作为新起点，
+   把之前的静音帧物理剔除，再与前一段的截断点做 8 ms 交叉淡化；全段都不超阈值时不裁，避免交出空数组。
+   首段保留原始片头留白，不裁。每个非首段无条件打印
+   `head_silence_trimmed: {帧数} frames ({毫秒}ms) at threshold -50.0dBFS`（裁到 0 帧也打印，
+   用来区分「这段本来没有垫片」和「算法没跑」），汇总进 `head_trim_ms`，并通过
+   `StitchResponse.head_trim_sec` 回传，供前端换算段内偏移。
+4. **防爆音**：
    - 去直流偏置（`mixed -= mixed.mean(axis=0)`）；
    - 成品首尾 12 ms 余弦淡入/淡出（`_apply_edge_fade`）；
    - 峰值限制到 −1 dBFS，**仅做衰减不做放大**（`_limit_peak`），避免削波同时不引入额外失真。
-4. **写出**：pydub `from_wav` → Python `wave` 模块直接写 WAV，因此在没有 ffmpeg 的环境也能工作。
-5. **多段顺序拼接**（`stitch_sequence`）：用 `pending_crossfade` 把「上一段的交叉淡化时长」应用到
-   当前接缝，保证语义与请求中的 `crossfade_ms` 一致。
+5. **写出**：pydub `from_wav` → Python `wave` 模块直接写 WAV，因此在没有 ffmpeg 的环境也能工作。
+6. **多段顺序拼接**（`stitch_sequence`）：用 `pending_crossfade` 把「上一段的交叉淡化时长」应用到
+   当前接缝，保证语义与请求中的 `crossfade_ms` 一致；每个接缝打印
+   `prev_end / overlap / segment_start / next_len / head_trim` 的毫秒级审计日志。
 
 ---
 
@@ -442,10 +472,14 @@ ffmpeg -y -i source.mp3 -ar 44100 -ac 2 -c:a pcm_s16le output.wav
 - **重排**：拖拽（鼠标手柄或键盘 Space + 方向键 + Space）后重新计算时间轴区间与总时长，并清空过期成品。
 - **拼接**：按时间轴顺序收集已锁定 Take（至少 2 段）调用 `/api/stitch`，`crossfade_ms` 固定 8；
   未全部锁定时提示「将只拼接已锁定段落」，全部锁定后按钮高亮，展示成品波形与 WAV 下载链接。
-- **按点续写**：成品波形点击（wavesurfer `interaction`）记下落点并显示白色标记线，用
-  `segment_start_sec` 反查「哪一段 · 段内第几秒」；在续写歌词框写词后点「从此处续写」，
-  以该段的 `clipId` + 段内偏移调用 `/api/generate`，返回的音频作为新候选追加到该段下方，
-  试听后再决定是否锁定。落点离段首/段尾过近（< 0.2s / 剩余 < 0.5s）或该段缺少片段 ID 时按钮禁用并说明原因。
+- **按点续写**：`WaveformExtendPlayer.tsx` 承接成品波形与续写控件，落点、歌词与请求中状态都是组件
+  内部 state（`Studio.tsx` 用 `key={mix.filename}` 挂载，换新成品即重置）；结果通过 `onTakes` 回写
+  段落候选。成品波形点击（wavesurfer `interaction`）记下落点并显示白色标记线，用
+  `segment_start_sec` 反查「哪一段 · 段内第几秒」（加上该段的 `head_trim_sec` 才回到源片段自身时间轴）；
+  在续写歌词框写词后点「从此处续写」，以该段的 `clipId` + 段内偏移、`max_clips=2` 调用
+  `/api/generate`，主片段与 `X-Suno-Extra-Clips` 里的残值片段一并作为新候选追加到该段下方
+  （「候选项 04 / 05」，都是待选择，已锁定的那条不动），试听后再决定是否锁定。
+  落点离段首/段尾过近（< 0.2s / 剩余 < 0.5s）或该段缺少片段 ID 时按钮禁用并说明原因。
 
 ---
 

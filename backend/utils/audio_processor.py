@@ -10,6 +10,8 @@
 - 首尾余弦淡入淡出（默认 12ms），消除文件边界突变；
 - 逐段去直流偏移，避免 DC 阶跃产生低频"噗"声；
 - 统一采样率 / 声道 / 位深后再混音；
+- 非首段先做首部静音裁切（默认 -50 dBFS 帧能量阈值）：续写音频头部带约 270ms 数字静音，
+  直接交叉淡化会在交接点形成听感真空；
 - 终混仅做峰值衰减（默认 -1 dBFS），不软削波、不压限，保留动态。
 """
 
@@ -40,6 +42,8 @@ SAMPLE_WIDTH = 2  # 16-bit
 DEFAULT_CROSSFADE_MS = 200
 DEFAULT_EDGE_FADE_MS = 12
 DEFAULT_PEAK_DBFS = -1.0
+# Suno 续写音频头部带约 270ms 数字静音，直接交叉淡化会听感断层，按帧能量剔除
+HEAD_TRIM_THRESHOLD_DBFS = -50.0
 MAX_DOWNLOAD_BYTES = 60 * 1024 * 1024
 
 DEFAULT_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -159,6 +163,25 @@ def _crossfade(a: np.ndarray, b: np.ndarray, crossfade_samples: int) -> np.ndarr
     return np.concatenate([a[:-crossfade_samples], overlap, b[crossfade_samples:]], axis=0)
 
 
+def _trim_head_silence(current: np.ndarray, threshold_dbfs: float) -> Tuple[np.ndarray, int]:
+    """物理剔除起始的静音帧，返回 (裁剪后数组, 剔除的帧数)。
+
+    按帧取声道最大绝对值，第一个超过阈值的帧即新起点；整段都不超过阈值时不裁，
+    否则会交出空数组。
+    """
+    if current.shape[0] == 0:
+        return current, 0
+    threshold = 10.0 ** (threshold_dbfs / 20.0)
+    frame_peak = np.max(np.abs(current), axis=1)
+    above = np.nonzero(frame_peak >= threshold)[0]
+    if above.size == 0:
+        return current, 0
+    start = int(above[0])
+    if start == 0:
+        return current, 0
+    return current[start:], start
+
+
 def _apply_edge_fade(samples: np.ndarray, frame_rate: int, edge_fade_ms: int) -> np.ndarray:
     """终混首尾余弦淡变，防止播放器起停时出现 click。"""
     n = min(int(frame_rate * max(0, edge_fade_ms) / 1000.0), samples.shape[0] // 2)
@@ -260,15 +283,17 @@ def stitch_sequence(
     *,
     edge_fade_ms: int = DEFAULT_EDGE_FADE_MS,
     peak_dbfs: float = DEFAULT_PEAK_DBFS,
-) -> Tuple[str, float, float, List[float]]:
+    head_trim_threshold_dbfs: float = HEAD_TRIM_THRESHOLD_DBFS,
+) -> Tuple[str, float, float, List[float], List[float]]:
     """按顺序拼接任意多段音频，每段可指定到下一段的交叉淡化时长。
 
     Args:
         sources: [(音频路径或 URL, 与下一段的 crossfade_ms), ...]
         output_path: 输出路径；默认 static/output/stitch_xxx.wav
+        head_trim_threshold_dbfs: 首部静音裁切的帧能量阈值，默认 -50 dBFS
 
     Returns:
-        (输出路径, 成品时长秒, 成品峰值 dBFS, 每段在成品中的起点秒数)
+        (输出路径, 成品时长秒, 成品峰值 dBFS, 每段在成品中的起点秒数, 每段被剔除的头部秒数)
     """
     if not sources:
         raise AudioSourceError("至少需要一段音频")
@@ -281,6 +306,7 @@ def stitch_sequence(
         mixed: Optional[np.ndarray] = None
         pending_crossfade = 0
         segment_starts: List[float] = []
+        head_trim: List[float] = []
         for index, (source, crossfade_to_next) in enumerate(sources):
             current, rate, temp = _load_audio(source)
             if temp is not None:
@@ -290,6 +316,7 @@ def stitch_sequence(
                 frame_rate = rate
                 pending_crossfade = crossfade_to_next
                 segment_starts.append(0.0)
+                head_trim.append(0.0)
                 continue
             if rate != frame_rate:
                 raise AudioSourceError("音频采样率未能统一")
@@ -297,6 +324,20 @@ def stitch_sequence(
                 raise AudioSourceError("输入音频为空")
             if mixed.size == 0:
                 raise AudioSourceError("输入音频为空")
+            # 首段保留原始片头留白；后续段落先剔除垫片再做交叉淡化，避免交接处听感真空
+            current, trimmed = _trim_head_silence(current, head_trim_threshold_dbfs)
+            head_trim.append(trimmed / float(frame_rate))
+            if current.shape[0] == 0:
+                raise AudioSourceError("输入音频裁剪后为空")
+            logger.info(
+                "head_silence_trimmed: %d frames (%.3fms) at threshold %.1fdBFS "
+                "(stitch step %d, remaining=%.3fms)",
+                trimmed,
+                trimmed * 1000.0 / frame_rate,
+                head_trim_threshold_dbfs,
+                index,
+                current.shape[0] * 1000.0 / frame_rate,
+            )
             max_crossfade = max(0, min(mixed.shape[0], current.shape[0]) - 1)
             requested = int(max(0, pending_crossfade) * frame_rate / 1000.0)
             applied = min(requested, max_crossfade)
@@ -306,12 +347,13 @@ def stitch_sequence(
             mixed = _crossfade(mixed, current, applied)
             logger.info(
                 "stitch step %d junction audit: prev_end=%.3fms overlap=%.3fms "
-                "segment_start=%.3fms next_len=%.3fms samples=%d/%d",
+                "segment_start=%.3fms next_len=%.3fms head_trim=%.3fms samples=%d/%d",
                 index,
                 prev_end * 1000.0 / frame_rate,
                 applied * 1000.0 / frame_rate,
                 segment_starts[-1] * 1000.0,
                 current.shape[0] * 1000.0 / frame_rate,
+                trimmed * 1000.0 / frame_rate,
                 applied,
                 max_crossfade,
             )
@@ -330,13 +372,14 @@ def stitch_sequence(
         peak = float(np.max(np.abs(mixed))) if mixed.size else 0.0
         peak_dbfs_actual = 20.0 * np.log10(peak) if peak > 0 else -120.0
         logger.info(
-            "stitch done: frames=%d rate=%d duration=%.3fs segment_start_ms=%s",
+            "stitch done: frames=%d rate=%d duration=%.3fs segment_start_ms=%s head_trim_ms=%s",
             mixed.shape[0],
             frame_rate,
             duration,
             [round(start * 1000.0, 3) for start in segment_starts],
+            [round(sec * 1000.0, 3) for sec in head_trim],
         )
-        return str(path), duration, float(peak_dbfs_actual), segment_starts
+        return str(path), duration, float(peak_dbfs_actual), segment_starts, head_trim
     finally:
         for temp in temps:
             temp.unlink(missing_ok=True)

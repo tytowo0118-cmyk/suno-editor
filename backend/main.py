@@ -43,6 +43,8 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    # 不声明的话浏览器读不到这三个头，续写与双生片段挂载会静默失效
+    expose_headers=["X-Suno-Task-Id", "X-Suno-Clip-Id", "X-Suno-Extra-Clips"],
 )
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

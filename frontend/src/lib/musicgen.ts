@@ -4,11 +4,19 @@ import type { Take } from "./types";
 /** FastAPI 后端的 Suno 代理端点：只接收 prompt，返回整段 WAV */
 export const GENERATE_ENDPOINT = `${API_BASE}/api/generate`;
 
+/** 同一任务里第 2 个已扣费片段（双生），后端已下载转码为 /static 上的 WAV */
+interface ExtraClip {
+  clipId: string | null;
+  url: string;
+  duration: number;
+}
+
 interface GeneratedAudio {
   url: string;
   duration: number;
   /** 本次音频对应的 Suno clip id，续写时需要回传给后端 */
   clipId: string | null;
+  extras: ExtraClip[];
 }
 
 interface GenerateRequest {
@@ -17,6 +25,8 @@ interface GenerateRequest {
   signal?: AbortSignal;
   continueClipId?: string;
   continueAt?: number;
+  /** 一次任务上游固定产出 2 个片段，>1 时把多出来的那些一并取回 */
+  maxClips?: number;
 }
 
 function readDuration(blobUrl: string): Promise<number> {
@@ -55,6 +65,46 @@ function extractDetail(text: string): string {
   return trimmed.slice(0, 160);
 }
 
+/** 后端把双生片段列表 base64 放在 X-Suno-Extra-Clips 里（纯 ASCII JSON，可直接 atob） */
+function readExtraClips(response: Response): ExtraClip[] {
+  const raw = response.headers.get("x-suno-extra-clips")?.trim();
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(atob(raw));
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      const record = item as { clipId?: unknown; url?: unknown; duration?: unknown };
+      if (typeof record.url !== "string" || !record.url) return [];
+      return [
+        {
+          clipId: typeof record.clipId === "string" ? record.clipId : null,
+          url: record.url,
+          duration: typeof record.duration === "number" ? record.duration : 0,
+        },
+      ];
+    });
+  } catch {
+    return [];
+  }
+}
+
+async function fetchExtraAudio(extra: ExtraClip, signal?: AbortSignal): Promise<GeneratedAudio> {
+  const response = await fetch(extra.url, { signal, cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`双生片段下载失败（HTTP ${response.status}）`);
+  }
+  const blob = await response.blob();
+  const header = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
+  if (!isWav(header)) {
+    throw new Error("双生片段不是 WAV 音频");
+  }
+  const url = URL.createObjectURL(blob);
+  const duration =
+    Number.isFinite(extra.duration) && extra.duration > 0 ? extra.duration : await readDuration(url);
+  return { url, duration, clipId: extra.clipId, extras: [] };
+}
+
 async function generateOne(input: GenerateRequest): Promise<GeneratedAudio> {
   const form = new FormData();
   // 结构标签与歌词已在调用方拼进 prompt
@@ -64,6 +114,9 @@ async function generateOne(input: GenerateRequest): Promise<GeneratedAudio> {
   if (input.continueClipId) {
     form.append("continue_clip_id", input.continueClipId);
     form.append("continue_at", Math.max(0, input.continueAt ?? 0).toFixed(3));
+  }
+  if (input.maxClips && input.maxClips > 1) {
+    form.append("max_clips", String(input.maxClips));
   }
 
   let response: Response;
@@ -88,6 +141,7 @@ async function generateOne(input: GenerateRequest): Promise<GeneratedAudio> {
 
   const contentType = response.headers.get("content-type") ?? "未知";
   const clipId = response.headers.get("x-suno-clip-id")?.trim() || null;
+  const extras = readExtraClips(response);
   const blob = await response.blob();
   const header = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
   if (!isWav(header)) {
@@ -97,7 +151,7 @@ async function generateOne(input: GenerateRequest): Promise<GeneratedAudio> {
   const url = URL.createObjectURL(blob);
   try {
     const duration = await readDuration(url);
-    return { url, duration, clipId };
+    return { url, duration, clipId, extras };
   } catch (error) {
     URL.revokeObjectURL(url);
     throw error;
@@ -147,30 +201,59 @@ export async function generateTakes(input: {
 
 /**
  * 从某个 clip 的指定秒数续写：上游把 continueAt 之前的音频当作创作上下文，
- * 返回一段在其后新生成的音频（实测不含原开头），因此结果适合作为该段的额外候选试听。
+ * 返回在其后新生成的音频（实测不含原开头），因此结果适合作为该段的额外候选试听。
+ * 一次任务上游固定产出 2 个片段（双生），这里全部下载并挂载为独立候选，
+ * 免得已扣费的另一半被丢掉。
  */
-export async function continueTake(input: {
+export async function continueTakes(input: {
   sectionId: string;
   clipId: string;
   continueAt: number;
   prompt: string;
   durationSec: number;
   signal?: AbortSignal;
-}): Promise<Take> {
+}): Promise<Take[]> {
   const audio = await generateOne({
     prompt: input.prompt,
     durationSec: input.durationSec,
     signal: input.signal,
     continueClipId: input.clipId,
     continueAt: input.continueAt,
+    maxClips: 2,
   });
-  return {
-    id: `${input.sectionId}-continue-${Date.now().toString(36)}`,
-    label: "Take 续写",
-    audioUrl: audio.url,
-    duration: audio.duration,
-    clipId: audio.clipId ?? input.clipId,
-  };
+
+  const stamp = Date.now().toString(36);
+  const label = (index: number) => `续写分支 ${String.fromCharCode(65 + index)}`;
+  const takes: Take[] = [
+    {
+      id: `${input.sectionId}-continue-a-${stamp}`,
+      label: label(0),
+      audioUrl: audio.url,
+      duration: audio.duration,
+      clipId: audio.clipId ?? input.clipId,
+    },
+  ];
+
+  for (const extra of audio.extras) {
+    try {
+      const downloaded = await fetchExtraAudio(extra, input.signal);
+      takes.push({
+        id: `${input.sectionId}-continue-${stamp}-${takes.length}`,
+        label: label(takes.length),
+        audioUrl: downloaded.url,
+        duration: downloaded.duration,
+        clipId: downloaded.clipId,
+      });
+    } catch (error) {
+      if (input.signal?.aborted) {
+        revokeTakeAudio(takes);
+        throw error;
+      }
+      // 残值片段取不回来不该作废整次续写，保留已经挂载的候选
+    }
+  }
+
+  return takes;
 }
 
 export function revokeTakeAudio(takes: Take[] | undefined): void {

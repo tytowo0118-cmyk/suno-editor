@@ -9,12 +9,16 @@
 当作创作上下文，返回一段以此为基础**重新生成**的续写音频（实测并不包含原开头，因此它是一版
 新候选而不是延长版）；响应头 `X-Suno-Clip-Id` 回传本次音频的 clip id，可继续作为下一次续写的源。
 
+一次任务上游固定产出 2 个片段（双生），`max_clips=2` 时第 2 个也会下载转码，通过
+`X-Suno-Extra-Clips`（base64 编码的 JSON 数组）回传，供前端挂载为同段落的另一个候选。
+
 上游代理地址与密钥通过环境变量配置：SUNO_API_BASE / SUNO_API_KEY。
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -27,7 +31,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
-from fastapi import APIRouter, Form, HTTPException
+from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import FileResponse
 
 from utils.audio_processor import STATIC_DIR
@@ -182,49 +186,83 @@ def _is_success(body: Any) -> bool:
     return str(body.get("code")).strip().lower() in {"", "0", "200", "success", "ok"}
 
 
-def _fetch_state(payload: Any) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
+CLIP_LIST_KEYS = ("clips", "sunoData", "records", "data", "clip")
+
+
+def _clip_list(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """取出任务负载里的片段数组；不同网关版本键名不统一。"""
+    for key in CLIP_LIST_KEYS:
+        nested = data.get(key)
+        if isinstance(nested, dict):
+            nested = [nested]
+        if isinstance(nested, list):
+            items = [item for item in nested if isinstance(item, dict)]
+            if items:
+                return items
+    return []
+
+
+def _clip_state(clip: dict[str, Any]) -> str:
+    return str(clip.get("status") or clip.get("state") or "").strip().upper()
+
+
+def _clip_record(clip: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """片段落定且有成品地址时返回 {clip_id, audio_url}，否则 None。"""
+    state = _clip_state(clip)
+    if state in FAILED_STATES or state in PENDING_STATES:
+        return None
+    audio_url = _pick_str(clip, ("audio_url", "audioUrl"))
+    if not audio_url:
+        return None
+    return {"clip_id": _pick_str(clip, ("clip_id", "clipId", "id")), "audio_url": audio_url}
+
+
+def _fetch_state(payload: Any) -> tuple[str, list[dict[str, Any]], Optional[str]]:
+    """解析轮询负载，返回 (任务状态, 已可下载的片段列表, 失败信息)。
+
+    一次 Suno 任务固定产出 2 个片段（双生），这里按上游顺序返回全部已落定的片段，
+    由调用方决定取几个，避免只读 data[0] 浪费掉一半已扣费的结果。
+    """
     data = payload.get("data") if isinstance(payload, dict) else payload
     if isinstance(data, list):
-        data = data[0] if data else None
+        clip_items = [item for item in data if isinstance(item, dict)]
+        data = clip_items[0] if clip_items else None
     if not isinstance(data, dict):
-        return "", None, None, None
+        return "", [], None
 
     status = str(data.get("status", "")).strip().upper()
-    audio_url = _pick_str(data, ("audio_url", "audioUrl", "url"))
     message = _pick_str(data, ("fail_reason", "error_message", "message", "msg", "error"))
     if isinstance(message, str) and not message.strip():
         message = None
-    clip_id = _pick_str(data, ("clip_id", "clipId"))
 
-    clip: Optional[dict[str, Any]] = None
-    for key in ("clips", "sunoData", "records", "clip", "data"):
-        nested = data.get(key)
-        if isinstance(nested, list):
-            nested = nested[0] if nested else None
-        if isinstance(nested, dict):
-            clip = nested
-            break
-
-    clip_status = ""
-    if clip is not None:
-        if not audio_url:
-            audio_url = _pick_str(clip, ("audio_url", "audioUrl"))
-        if not clip_id:
-            clip_id = _pick_str(clip, ("clip_id", "clipId", "id"))
-        clip_status = str(clip.get("status") or clip.get("state") or "").strip().upper()
+    clips: list[dict[str, Any]] = []
+    nested = _clip_list(data)
+    if nested:
+        for clip in nested:
+            record = _clip_record(clip)
+            if record is not None:
+                clips.append(record)
         if not status:
-            status = clip_status
-        if not message:
-            message = _pick_str(clip, ("fail_reason", "error_message", "message", "msg", "error"))
+            status = _clip_state(nested[0])
+        if not clips and any(_clip_state(c) in FAILED_STATES for c in nested):
+            status = "FAILED"
+            failed = next(c for c in nested if _clip_state(c) in FAILED_STATES)
+            message = _pick_str(failed, ("fail_reason", "error_message", "message", "msg", "error"))
+    else:
+        # 少数网关把音频直接挂在任务层，合成一条伪片段记录
+        task_audio = _pick_str(data, ("audio_url", "audioUrl", "url"))
+        if status in FAILED_STATES:
+            task_audio = None
+        elif status in PENDING_STATES:
+            # streaming 阶段的地址是流地址而非成品，必须等状态落定
+            task_audio = None
+        if task_audio:
+            clips.append({"clip_id": _pick_str(data, ("clip_id", "clipId")), "audio_url": task_audio})
 
-    # streaming 阶段的 audio_url 是流地址而非成品，必须等片段状态落定
-    if clip_status in PENDING_STATES:
-        audio_url = None
-    if status in FAILED_STATES or clip_status in FAILED_STATES:
-        audio_url = None
-        status = status if status in FAILED_STATES else clip_status
+    if status in FAILED_STATES:
+        clips = []
 
-    return status, audio_url, message, clip_id
+    return status, clips, message
 
 
 async def _submit(
@@ -287,8 +325,13 @@ async def _submit(
 
 
 async def _wait_for_audio(
-    client: httpx.AsyncClient, base: str, headers: dict[str, str], task_id: str
-) -> tuple[str, Optional[str]]:
+    client: httpx.AsyncClient,
+    base: str,
+    headers: dict[str, str],
+    task_id: str,
+    max_clips: int = 1,
+) -> list[dict[str, Any]]:
+    """轮询直到至少有一个片段落定，返回最多 max_clips 条 {clip_id, audio_url}。"""
     interval = max(0.05, _env_float("SUNO_POLL_INTERVAL", 5.0))
     timeout = max(10, _env_int("SUNO_TIMEOUT", 300))
     deadline = time.monotonic() + timeout
@@ -314,12 +357,12 @@ async def _wait_for_audio(
         except ValueError:
             body = None
 
-        status, audio_url, message, clip_id = _fetch_state(body)
+        status, clips, message = _fetch_state(body)
         if status in FAILED_STATES:
             raise HTTPException(status_code=502, detail=f"Suno 生成失败：{message or status}")
-        if audio_url and status not in FAILED_STATES:
-            return audio_url, clip_id
-        if status in COMPLETE_STATES and not audio_url:
+        if clips:
+            return clips[:max_clips]
+        if status in COMPLETE_STATES:
             raise HTTPException(status_code=502, detail="Suno 任务已完成但没有返回音频地址")
 
         if time.monotonic() >= deadline:
@@ -390,20 +433,67 @@ async def _to_wav(source: Path, target: Path) -> None:
 
 CLIP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MAX_CONTINUE_AT = 600.0
+# 一次 Suno 任务固定产出 2 个片段，超出部分不下载
+MAX_CLIPS_PER_TASK = 2
+DOWNLOAD_SUFFIXES = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
+
+
+async def _materialize(
+    client: httpx.AsyncClient, record: dict[str, Any], stem: str, index: int
+) -> tuple[Path, float]:
+    """下载并转码单个片段，返回 (WAV 路径, 时长秒)。index 0 用主文件名。"""
+    audio_url = record["audio_url"]
+    suffix = Path(urllib.parse.urlparse(audio_url).path).suffix.lower()
+    if suffix not in DOWNLOAD_SUFFIXES:
+        suffix = ".mp3"
+    # 临时下载名带 _src 后缀：上游直接给 .wav 时，若与 target 同名 ffmpeg 会报
+    # 「same as Input」，且 finally 里的 unlink 会连成品一起删掉
+    source = OUTPUT_DIR / f"{stem}_{index}_src{suffix}"
+    target = OUTPUT_DIR / (f"{stem}.wav" if index == 0 else f"{stem}_{index}.wav")
+    try:
+        await _download(client, audio_url, source)
+        await _to_wav(source, target)
+    finally:
+        source.unlink(missing_ok=True)
+
+    with wave.open(str(target), "rb") as handle:
+        frames, frame_rate, channels, sample_width = (
+            handle.getnframes(),
+            handle.getframerate(),
+            handle.getnchannels(),
+            handle.getsampwidth(),
+        )
+    duration = frames / float(frame_rate)
+    logger.info(
+        "suno wav written [%d/%d]: %s start=0.000s duration=%.3fs frames=%d rate=%d ch=%d bits=%d",
+        index + 1,
+        MAX_CLIPS_PER_TASK,
+        target.name,
+        duration,
+        frames,
+        frame_rate,
+        channels,
+        sample_width * 8,
+    )
+    return target, duration
 
 
 @router.post("/generate")
 async def generate_music(
+    request: Request,
     prompt: str = Form(..., max_length=4000),
     duration: Optional[float] = Form(default=None),
     continue_clip_id: str = Form(default=""),
     continue_at: Optional[float] = Form(default=None),
+    max_clips: int = Form(default=1),
 ):
     """同步代理 Suno：提交任务 → 轮询 → 下载 → 转 WAV → 返回音频流。
 
     `duration` 仅为兼容前端占位字段，实际时长由 Suno 根据歌词决定。
     带 `continue_clip_id` 时改为续写：上游把该 clip 在 `continue_at` 秒之前的音频当作创作上下文，
     返回一段在其后**新生成**的音频（不是原音频的延长版，适合当作该段的额外候选试听）。
+    `max_clips=2` 时把同一任务的第 2 个片段也下载转码，以 base64(JSON) 放在
+    `X-Suno-Extra-Clips` 响应头里返回，避免已扣费的双生结果被丢弃。
     """
     del duration
     clip_id = continue_clip_id.strip()
@@ -413,6 +503,7 @@ async def generate_music(
         raise HTTPException(status_code=422, detail="continue_at 需要配合 continue_clip_id 使用")
     if continue_at is not None and not 0 <= continue_at <= MAX_CONTINUE_AT:
         raise HTTPException(status_code=422, detail=f"continue_at 需要在 0–{int(MAX_CONTINUE_AT)} 秒之间")
+    wanted_clips = min(max(1, max_clips), MAX_CLIPS_PER_TASK)
 
     base, headers = _upstream()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -425,48 +516,56 @@ async def generate_music(
         logger.info("suno task submitted: %s", task_id)
 
         started = time.perf_counter()
-        audio_url, source_clip_id = await _wait_for_audio(client, base, headers, task_id)
+        records = await _wait_for_audio(client, base, headers, task_id, wanted_clips)
         logger.info(
-            "suno task ready: %s (%.1fs) clip=%s -> %s",
+            "suno task ready: %s (%.1fs) clips=%d ids=%s",
             task_id,
             time.perf_counter() - started,
-            source_clip_id,
-            audio_url,
+            len(records),
+            [record["clip_id"] for record in records],
         )
 
         stem = f"suno_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-        suffix = Path(urllib.parse.urlparse(audio_url).path).suffix.lower()
-        if suffix not in {".mp3", ".wav", ".m4a", ".flac", ".ogg"}:
-            suffix = ".mp3"
-        source = OUTPUT_DIR / f"{stem}{suffix}"
-        target = OUTPUT_DIR / f"{stem}.wav"
+        materialized: list[tuple[Path, float]] = []
+        for index, record in enumerate(records):
+            try:
+                materialized.append(await _materialize(client, record, stem, index))
+            except HTTPException:
+                for path, _duration in materialized:
+                    path.unlink(missing_ok=True)
+                raise
 
-        try:
-            await _download(client, audio_url, source)
-            await _to_wav(source, target)
-        finally:
-            source.unlink(missing_ok=True)
-
-        with wave.open(str(target), "rb") as handle:
-            frames, frame_rate, channels, sample_width = (
-                handle.getnframes(),
-                handle.getframerate(),
-                handle.getnchannels(),
-                handle.getsampwidth(),
-            )
+        base_url = str(request.base_url).rstrip("/")
+        extras = [
+            {
+                "clipId": records[index]["clip_id"],
+                "url": f"{base_url}/static/output/{materialized[index][0].name}",
+                "duration": round(materialized[index][1], 3),
+            }
+            for index in range(1, len(materialized))
+        ]
         logger.info(
-            "suno wav written: %s start=0.000s duration=%.3fs frames=%d rate=%d ch=%d bits=%d",
-            target.name,
-            frames / float(frame_rate),
-            frames,
-            frame_rate,
-            channels,
-            sample_width * 8,
+            "suno dual mount: task=%s kept=%d/%d extras=%d",
+            task_id,
+            len(materialized),
+            wanted_clips,
+            len(extras),
         )
+
+    target, _ = materialized[0]
+    extra_header = (
+        base64.b64encode(json.dumps(extras, ensure_ascii=True).encode("utf-8")).decode("ascii")
+        if extras
+        else ""
+    )
 
     return FileResponse(
         target,
         media_type="audio/wav",
         filename=target.name,
-        headers={"X-Suno-Task-Id": task_id, "X-Suno-Clip-Id": source_clip_id or ""},
+        headers={
+            "X-Suno-Task-Id": task_id,
+            "X-Suno-Clip-Id": records[0]["clip_id"] or "",
+            "X-Suno-Extra-Clips": extra_header,
+        },
     )

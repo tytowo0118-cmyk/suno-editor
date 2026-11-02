@@ -171,17 +171,22 @@ export function buildTimings(sections: TimelineSection[]) {
 /**
  * 成品时间轴上的某一秒段 → 它落在哪个源片段、片段内偏移多少秒。
  * 起点由后端拼接时按实际重叠样本量算出，因此这里直接二分式地找最后一个不超过该点的段。
+ * 拼接会物理剔除源片段头部静音，所以偏移要加回这段垫片，才能对回源片段自身的时间轴（续写用）。
  */
 export function locateMixSegment(
   segmentOrder: string[],
   segmentStartSec: number[],
   timeSec: number,
+  headTrimSec: number[] = [],
 ): { sectionId: string; offsetSec: number } | null {
   let found: { sectionId: string; offsetSec: number } | null = null;
   for (let index = 0; index < segmentOrder.length; index += 1) {
     const start = segmentStartSec[index];
     if (!Number.isFinite(start) || start > timeSec) break;
-    found = { sectionId: segmentOrder[index], offsetSec: timeSec - start };
+    found = {
+      sectionId: segmentOrder[index],
+      offsetSec: timeSec - start + (headTrimSec[index] ?? 0),
+    };
   }
   return found;
 }

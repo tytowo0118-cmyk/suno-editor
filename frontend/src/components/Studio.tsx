@@ -10,19 +10,18 @@ import {
   parseLyricBlocks,
   sectionTag,
 } from "@/lib/lyrics";
-import { GENERATE_ENDPOINT, continueTake, generateTakes, revokeTakeAudio } from "@/lib/musicgen";
+import { GENERATE_ENDPOINT, generateTakes, revokeTakeAudio } from "@/lib/musicgen";
 import {
   CROSSFADE_MS,
   DEFAULT_SONG_PROMPT,
   INITIAL_SECTIONS,
-  formatClock,
-  locateMixSegment,
 } from "@/lib/sections";
 import type { StitchResult, Take, TimelineSection } from "@/lib/types";
 import SongBriefPanel from "./SongBriefPanel";
 import TakeCard from "./TakeCard";
 import Timeline from "./Timeline";
-import WaveformPlayer, { pauseAllAudio } from "./WaveformPlayer";
+import WaveformExtendPlayer from "./WaveformExtendPlayer";
+import { pauseAllAudio } from "./WaveformPlayer";
 
 type StudioStep = "brief" | "studio";
 
@@ -42,9 +41,6 @@ export default function Studio() {
   const [errors, setErrors] = useState<Record<string, string | null>>({});
   const [mix, setMix] = useState<StitchResult | null>(null);
   const [stitching, setStitching] = useState(false);
-  const [mixPoint, setMixPoint] = useState<number | null>(null);
-  const [continueLyrics, setContinueLyrics] = useState("");
-  const [continuing, setContinuing] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [songPrompt, setSongPrompt] = useState(DEFAULT_SONG_PROMPT);
   const [lyrics, setLyrics] = useState("");
@@ -189,7 +185,6 @@ export default function Studio() {
     setLoading({});
     setErrors({});
     setMix(null);
-    setMixPoint(null);
     setActiveId(nextSections[0].id);
     setLyrics(nextLyrics);
     setLyricsError(null);
@@ -372,8 +367,6 @@ export default function Studio() {
         })),
       );
       setMix(result);
-      setMixPoint(null);
-      setContinueLyrics("");
       setNotice(`成品已生成：${result.duration.toFixed(2)}s · 峰值 ${result.peakDbfs.toFixed(1)} dBFS`);
     } catch (error) {
       setNotice(error instanceof Error ? `拼接失败：${error.message}` : "拼接失败");
@@ -382,76 +375,7 @@ export default function Studio() {
     }
   };
 
-  /**
-   * 从成品波形上的续写点续写：把全曲时间换算回源 clip 的段内偏移，
-   * 交给 Suno 的 continue_at 生成其后的新内容，结果作为该段的额外候选。
-   */
-  const handleContinueFromMix = async () => {
-    if (!mix || mixPoint == null) return;
-    const target = locateMixSegment(mix.segmentOrder, mix.segmentStartSec, mixPoint);
-    if (!target) {
-      setNotice("续写点没有落在任何已锁定段落上，请重新点击波形");
-      return;
-    }
-    const section = sectionsRef.current.find((item) => item.id === target.sectionId);
-    const take = lockedRef.current[target.sectionId];
-    if (!section || !take) {
-      setNotice("续写点所在的段落没有锁定音频，无法续写");
-      return;
-    }
-    if (!take.clipId) {
-      setNotice("该段音频缺少 Suno clip id（后端未回传），无法续写，请重新生成这一段");
-      return;
-    }
-    if (target.offsetSec >= take.duration - 0.5) {
-      setNotice("续写点太接近该段结尾，请点在段落中间位置");
-      return;
-    }
-
-    // 留空时歌词为空 → 后端把该段标记为纯器乐，续写出器乐尾
-    const style = promptsRef.current[section.id] ?? section.prompt;
-    const prompt = [style, `${sectionTag(section)}\n${continueLyrics.trim()}`]
-      .filter(Boolean)
-      .join("\n\n");
-
-    pauseAllAudio();
-    setContinuing(true);
-    try {
-      const extended = await continueTake({
-        sectionId: section.id,
-        clipId: take.clipId,
-        continueAt: target.offsetSec,
-        prompt,
-        durationSec: take.duration,
-      });
-      // 上游返回的是「以点击点为上下文新生成」的音频，不替换锁定，只作为该段额外候选
-      setTakes((prev) => ({ ...prev, [section.id]: [...(prev[section.id] ?? []), extended] }));
-      setActiveId(section.id);
-      setNotice(
-        `已按续写点生成「${section.title}」的新候选（${extended.duration.toFixed(1)}s），试听后再决定是否锁定`,
-      );
-    } catch (error) {
-      setNotice(error instanceof Error ? `续写失败：${error.message}` : "续写失败");
-    } finally {
-      setContinuing(false);
-    }
-  };
-
   const activeIndex = sections.findIndex((section) => section.id === activeId);
-  const mixTarget =
-    mix && mixPoint != null
-      ? locateMixSegment(mix.segmentOrder, mix.segmentStartSec, mixPoint)
-      : null;
-  const mixTargetSection = mixTarget
-    ? sections.find((section) => section.id === mixTarget.sectionId)
-    : undefined;
-  const mixTargetTake = mixTarget ? locked[mixTarget.sectionId] : undefined;
-  const canContinue = Boolean(
-    mixTarget &&
-      mixTargetTake?.clipId &&
-      mixTarget.offsetSec >= 0.2 &&
-      mixTarget.offsetSec < (mixTargetTake?.duration ?? 0) - 0.5,
-  );
   const activeSection = sections[activeIndex] ?? sections[0];
   const activeTakes = takes[activeSection.id] ?? [];
   const activeLoading = Boolean(loading[activeSection.id]);
@@ -800,69 +724,21 @@ export default function Studio() {
                     </a>
                   </div>
                   <div className="mt-4 max-w-3xl">
-                    <WaveformPlayer
+                    <WaveformExtendPlayer
                       key={mix.filename}
-                      src={mix.audioUrl}
-                      playerId="final-mix"
-                      accent="#34d399"
-                      waveColor="rgba(52, 211, 153, 0.28)"
-                      progressColor="#a7f3d0"
-                      durationSec={mix.duration}
-                      markerSec={mixPoint}
-                      onPoint={(time) => setMixPoint(time)}
+                      mix={mix}
+                      sections={sections}
+                      locked={locked}
+                      prompts={prompts}
+                      onTakes={(sectionId, extended) =>
+                        setTakes((prev) => ({
+                          ...prev,
+                          [sectionId]: [...(prev[sectionId] ?? []), ...extended],
+                        }))
+                      }
+                      onActivate={setActiveId}
+                      onNotice={setNotice}
                     />
-                  </div>
-                  <p className="mt-2 font-mono text-[10px] text-zinc-500">
-                    {mix.duration.toFixed(2)}s · peak {mix.peakDbfs.toFixed(1)} dBFS ·{" "}
-                    {mix.segmentOrder.join(" → ")}
-                  </p>
-
-                  <div className="mt-4 rounded-2xl border border-white/[0.06] bg-black/20 px-4 py-3.5">
-                    <p className="text-[11px] leading-relaxed text-zinc-400">
-                      点击成品波形选择续写点，后端把全曲时间换算回该段 Suno clip 的段内秒数，以
-                      <span className="font-mono text-zinc-300"> continue_at </span>
-                      请求续写：该点之前的音频作为上下文，其后重新生成，结果作为该段的新候选追加在下方，
-                      试听满意再锁定。
-                    </p>
-                    {mixPoint != null && (
-                      <div className="mt-3 flex flex-wrap items-center gap-2">
-                        <span className="rounded-full border border-emerald-400/20 bg-emerald-400/[0.08] px-2.5 py-1 font-mono text-[10px] text-emerald-300">
-                          {formatClock(mixPoint)} →{" "}
-                          {mixTargetSection?.title ?? mixTarget?.sectionId ?? "未知段落"} · 段内{" "}
-                          {(mixTarget?.offsetSec ?? 0).toFixed(1)}s
-                        </span>
-                        <input
-                          value={continueLyrics}
-                          onChange={(event) => setContinueLyrics(event.target.value)}
-                          maxLength={500}
-                          placeholder="续写歌词（留空则接一段器乐）"
-                          className="h-9 min-w-0 flex-1 rounded-lg border border-white/10 bg-black/30 px-3 text-xs text-zinc-200 outline-none transition placeholder:text-zinc-600 focus:border-white/30"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => void handleContinueFromMix()}
-                          disabled={!canContinue || continuing}
-                          title={
-                            mixTargetTake?.clipId
-                              ? "消耗一个 Suno 任务额度"
-                              : "该段音频缺少 Suno clip id，无法续写"
-                          }
-                          className="inline-flex h-9 shrink-0 items-center gap-2 rounded-lg border border-emerald-300/25 bg-emerald-400/[0.08] px-3 text-xs text-emerald-200 transition hover:bg-emerald-400/[0.15] disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.04] disabled:text-zinc-600"
-                        >
-                          {continuing && (
-                            <span className="h-3 w-3 animate-spin rounded-full border border-emerald-200/30 border-t-emerald-200" />
-                          )}
-                          {continuing ? "续写中" : "从此处续写"}
-                        </button>
-                      </div>
-                    )}
-                    {mixPoint != null && !canContinue && !continuing && (
-                      <p className="mt-2 text-[10px] text-amber-300/80">
-                        {!mixTargetTake?.clipId
-                          ? "该段音频缺少 Suno clip id，请重新生成并锁定后再续写"
-                          : "续写点需要落在段落中段（距首尾各 0.5s 以上）"}
-                      </p>
-                    )}
                   </div>
                 </section>
               )}

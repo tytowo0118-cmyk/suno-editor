@@ -15,6 +15,7 @@ interface RawStitch {
   peak_dbfs: number;
   segment_order: string[];
   segment_start_sec: number[];
+  head_trim_sec?: number[];
 }
 
 function extractError(body: unknown, status: number): string {
@@ -108,5 +109,6 @@ export async function stitchTimeline(segments: Array<{
     peakDbfs: data.peak_dbfs,
     segmentOrder: data.segment_order,
     segmentStartSec: data.segment_start_sec ?? [],
+    headTrimSec: data.head_trim_sec ?? [],
   };
 }

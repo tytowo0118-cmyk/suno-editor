@@ -47,6 +47,8 @@ class StitchResponse(BaseModel):
     segment_order: List[str]
     # 每段在成品时间轴上的起点（秒），用于把整曲时间点映射回源片段
     segment_start_sec: List[float]
+    # 每段拼接时物理剔除的头部静音（秒）；换算回源片段时间轴需要加回这段偏移
+    head_trim_sec: List[float]
 
 
 def _normalize_source(url: str) -> str:
@@ -67,7 +69,7 @@ def stitch_timeline(payload: StitchRequest, request: Request) -> StitchResponse:
     sources = [(_normalize_source(seg.audio_url), seg.crossfade_ms) for seg in payload.segments]
 
     try:
-        output_path, duration, peak_dbfs, segment_starts = stitch_sequence(
+        output_path, duration, peak_dbfs, segment_starts, head_trim = stitch_sequence(
             sources, output_path=filename
         )
     except AudioSourceError as exc:
@@ -90,4 +92,5 @@ def stitch_timeline(payload: StitchRequest, request: Request) -> StitchResponse:
         crossfade_ms=[seg.crossfade_ms for seg in payload.segments],
         segment_order=[seg.id for seg in payload.segments],
         segment_start_sec=[round(start, 3) for start in segment_starts],
+        head_trim_sec=[round(sec, 3) for sec in head_trim],
     )
