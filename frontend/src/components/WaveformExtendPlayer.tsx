@@ -17,6 +17,8 @@ interface WaveformExtendPlayerProps {
   /** 把续写点所在段落切到前台，便于试听新候选 */
   onActivate: (sectionId: string) => void;
   onNotice: (message: string) => void;
+  /** 成品播放进度（约 20Hz），用于让结构时间轴上的色块同步滑动指针 */
+  onTimeUpdate?: (timeSec: number) => void;
 }
 
 /**
@@ -31,6 +33,7 @@ export default function WaveformExtendPlayer({
   onTakes,
   onActivate,
   onNotice,
+  onTimeUpdate,
 }: WaveformExtendPlayerProps) {
   const [point, setPoint] = useState<number | null>(null);
   const [lyrics, setLyrics] = useState("");
@@ -109,6 +112,7 @@ export default function WaveformExtendPlayer({
           durationSec={mix.duration}
           markerSec={point}
           onPoint={setPoint}
+          onTimeUpdate={onTimeUpdate}
         />
       </div>
       <p className="mt-2 font-mono text-[10px] text-zinc-500">

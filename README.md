@@ -472,6 +472,15 @@ ffmpeg -y -i source.mp3 -ar 44100 -ac 2 -c:a pcm_s16le output.wav
 - **重排**：拖拽（鼠标手柄或键盘 Space + 方向键 + Space）后重新计算时间轴区间与总时长，并清空过期成品。
 - **拼接**：按时间轴顺序收集已锁定 Take（至少 2 段）调用 `/api/stitch`，`crossfade_ms` 固定 8；
   未全部锁定时提示「将只拼接已锁定段落」，全部锁定后按钮高亮，展示成品波形与 WAV 下载链接。
+- **成品播放指针**：成品播放时，结构时间轴底部的色带上同步滑动一根白色指针，指针所在色块同步高亮。
+  `WaveformPlayer` 用 `onTimeUpdate` 上报进度——wavesurfer v8 的 `timeupdate` 由 rAF 每帧触发，
+  直接透传会让整棵 `Studio` 树每秒重渲染 60 次，因此限流到 50ms（约 20Hz），色块再用
+  `transition-[left] duration-75 ease-linear` 补间回平滑视觉。`Studio.tsx` 以 `mixCurrentTime`
+  持有该时间，连同后端回传的 `segment_order` / `segment_start_sec` / `duration` 组成 `playhead`
+  传给 `Timeline`；`sections.ts` 的 `mixPlayheadPosition()` 先定位落在哪个源片段，再按「该片段在
+  成品里的实际占长」与「该色块在色带上的宽度占比」二次换算成百分比——不能直接用
+  `Σ durationSec` 当分母，因为拼接会扣掉头部裁切与交叉淡化重叠，成品长度总比色带标称长度短
+  几十到几百毫秒。未锁定段落不进成品，指针会直接跨过它们的色块；`playhead` 为空时色带不渲染指针。
 - **按点续写**：`WaveformExtendPlayer.tsx` 承接成品波形与续写控件，落点、歌词与请求中状态都是组件
   内部 state（`Studio.tsx` 用 `key={mix.filename}` 挂载，换新成品即重置）；结果通过 `onTakes` 回写
   段落候选。成品波形点击（wavesurfer `interaction`）记下落点并显示白色标记线，用

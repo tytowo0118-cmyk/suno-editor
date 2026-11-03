@@ -40,6 +40,7 @@ export default function Studio() {
   const [loading, setLoading] = useState<Record<string, boolean>>({});
   const [errors, setErrors] = useState<Record<string, string | null>>({});
   const [mix, setMix] = useState<StitchResult | null>(null);
+  const [mixCurrentTime, setMixCurrentTime] = useState(0);
   const [stitching, setStitching] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [songPrompt, setSongPrompt] = useState(DEFAULT_SONG_PROMPT);
@@ -367,6 +368,7 @@ export default function Studio() {
         })),
       );
       setMix(result);
+      setMixCurrentTime(0);
       setNotice(`成品已生成：${result.duration.toFixed(2)}s · 峰值 ${result.peakDbfs.toFixed(1)} dBFS`);
     } catch (error) {
       setNotice(error instanceof Error ? `拼接失败：${error.message}` : "拼接失败");
@@ -517,6 +519,16 @@ export default function Studio() {
                 activeId={activeSection.id}
                 locked={locked}
                 generating={loading}
+                playhead={
+                  mix
+                    ? {
+                        timeSec: mixCurrentTime,
+                        segmentOrder: mix.segmentOrder,
+                        segmentStartSec: mix.segmentStartSec,
+                        durationSec: mix.duration,
+                      }
+                    : null
+                }
                 onSelect={handleSelectSection}
                 onReorder={handleReorder}
               />
@@ -738,6 +750,7 @@ export default function Studio() {
                       }
                       onActivate={setActiveId}
                       onNotice={setNotice}
+                      onTimeUpdate={setMixCurrentTime}
                     />
                   </div>
                 </section>

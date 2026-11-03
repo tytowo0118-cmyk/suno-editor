@@ -21,6 +21,8 @@ interface WaveformPlayerProps {
   durationSec: number;
   /** 用户点击/拖拽波形 seek 后回调，参数为整条音频内的秒数 */
   onPoint?: (timeSec: number) => void;
+  /** 播放进度回调；wavesurfer 每帧都发 timeupdate，这里限流到约 20Hz 以免拖垮父组件 */
+  onTimeUpdate?: (timeSec: number) => void;
   /** 在波形上标记一个秒数位置（如续写点） */
   markerSec?: number | null;
 }
@@ -35,11 +37,13 @@ export default function WaveformPlayer({
   progressColor,
   durationSec,
   onPoint,
+  onTimeUpdate,
   markerSec,
 }: WaveformPlayerProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const waveRef = useRef<WaveSurferType | null>(null);
   const onPointRef = useRef(onPoint);
+  const onTimeUpdateRef = useRef(onTimeUpdate);
   const [status, setStatus] = useState<Status>("loading");
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -49,8 +53,20 @@ export default function WaveformPlayer({
   }, [onPoint]);
 
   useEffect(() => {
+    onTimeUpdateRef.current = onTimeUpdate;
+  }, [onTimeUpdate]);
+
+  useEffect(() => {
     let disposed = false;
     let instance: WaveSurferType | null = null;
+    let lastReportSec = -1;
+
+    // 父组件的时间轴播放指针只需要约 20Hz，太密会让整棵 Studio 树跟着重渲染
+    const report = (time: number) => {
+      if (disposed || Math.abs(time - lastReportSec) < 0.05) return;
+      lastReportSec = time;
+      onTimeUpdateRef.current?.(time);
+    };
 
     void (async () => {
       const { default: WaveSurfer } = await import("wavesurfer.js");
@@ -83,10 +99,12 @@ export default function WaveformPlayer({
       });
       instance.on("timeupdate", (time) => {
         if (!disposed) setCurrentTime(time);
+        report(time);
       });
       instance.on("pause", () => {
         if (activeInstance === instance) activeInstance = null;
         if (!disposed) setIsPlaying(false);
+        report(instance?.getCurrentTime() ?? 0);
       });
       instance.on("finish", () => {
         instance?.seekTo(0);
@@ -95,6 +113,8 @@ export default function WaveformPlayer({
           setCurrentTime(0);
           setIsPlaying(false);
         }
+        lastReportSec = 0;
+        onTimeUpdateRef.current?.(0);
       });
       instance.on("error", (error) => {
         console.error("WaveSurfer load failed:", error);

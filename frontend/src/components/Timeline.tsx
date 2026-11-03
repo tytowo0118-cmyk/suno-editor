@@ -17,7 +17,7 @@ import {
   useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { buildTimings, formatClock } from "@/lib/sections";
+import { buildTimings, formatClock, mixPlayheadPosition, type MixPlayhead } from "@/lib/sections";
 import type { SectionTiming, Take, TimelineSection } from "@/lib/types";
 
 interface TimelineProps {
@@ -25,6 +25,8 @@ interface TimelineProps {
   activeId: string;
   locked: Record<string, Take | undefined>;
   generating: Record<string, boolean | undefined>;
+  /** 成品混音的播放位置，为空时时间轴不显示播放指针 */
+  playhead: MixPlayhead | null;
   onSelect: (id: string) => void;
   onReorder: (activeId: string, overId: string) => void;
 }
@@ -34,6 +36,8 @@ interface BlockProps {
   index: number;
   timing: SectionTiming;
   isActive: boolean;
+  /** 播放指针当前落在这一段 */
+  isPlaying: boolean;
   lockedTake?: Take;
   isGenerating: boolean;
   onSelect: (id: string) => void;
@@ -44,6 +48,7 @@ function SortableBlock({
   index,
   timing,
   isActive,
+  isPlaying,
   lockedTake,
   isGenerating,
   onSelect,
@@ -58,7 +63,11 @@ function SortableBlock({
     flexGrow: section.durationSec,
     flexBasis: 0,
     zIndex: isDragging ? 30 : undefined,
-    boxShadow: isActive ? `0 0 44px ${section.accent}22` : undefined,
+    boxShadow: isActive
+      ? `0 0 44px ${section.accent}22`
+      : isPlaying
+        ? `0 0 30px ${section.accent}2c`
+        : undefined,
   };
 
   return (
@@ -66,7 +75,7 @@ function SortableBlock({
       ref={setNodeRef}
       style={style}
       className={`group relative min-w-[132px] overflow-hidden rounded-2xl border transition-[box-shadow,opacity] ${section.blockClass} ${
-        isActive ? "ring-1 ring-white/35" : ""
+        isActive ? "ring-1 ring-white/35" : isPlaying ? "ring-1 ring-white/15" : ""
       } ${isDragging ? "opacity-70" : ""}`}
     >
       <button
@@ -120,6 +129,7 @@ export default function Timeline({
   activeId,
   locked,
   generating,
+  playhead,
   onSelect,
   onReorder,
 }: TimelineProps) {
@@ -129,6 +139,7 @@ export default function Timeline({
   );
   const timings = buildTimings(sections);
   const totalDuration = sections.reduce((sum, section) => sum + section.durationSec, 0);
+  const playheadPosition = playhead ? mixPlayheadPosition(sections, playhead) : null;
 
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
@@ -146,7 +157,17 @@ export default function Timeline({
             DRAG TO REORDER
           </span>
         </div>
-        <span className="font-mono text-[11px] text-zinc-500">总长 {totalDuration}s</span>
+        <span className="font-mono text-[11px] text-zinc-500">
+          {playhead ? (
+            <>
+              <span className="text-zinc-300">{formatClock(playhead.timeSec)}</span>
+              <span className="mx-1 text-zinc-600">/</span>
+              {`${playhead.durationSec.toFixed(2)}s`}
+            </>
+          ) : (
+            `总长 ${totalDuration}s`
+          )}
+        </span>
       </div>
 
       <div className="mt-4 overflow-x-auto pb-1">
@@ -168,6 +189,7 @@ export default function Timeline({
                   index={index}
                   timing={timings[index]}
                   isActive={section.id === activeId}
+                  isPlaying={playheadPosition?.sectionId === section.id}
                   lockedTake={locked[section.id]}
                   isGenerating={Boolean(generating[section.id])}
                   onSelect={onSelect}
@@ -178,14 +200,23 @@ export default function Timeline({
         </DndContext>
       </div>
 
-      <div className="mt-3 flex h-1 overflow-hidden rounded-full bg-white/5">
-        {sections.map((section) => (
-          <span
-            key={section.id}
-            className={`h-full opacity-60 ${section.barClass}`}
-            style={{ flexGrow: section.durationSec, flexBasis: 0 }}
+      <div className="relative mt-3">
+        <div className="flex h-1 overflow-hidden rounded-full bg-white/5">
+          {sections.map((section) => (
+            <span
+              key={section.id}
+              className={`h-full opacity-60 ${section.barClass}`}
+              style={{ flexGrow: section.durationSec, flexBasis: 0 }}
+            />
+          ))}
+        </div>
+        {playheadPosition && (
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute -top-1 bottom-[-3px] w-0.5 -translate-x-1/2 rounded-full bg-white shadow-[0_0_10px_rgba(255,255,255,0.7)] transition-[left] duration-75 ease-linear"
+            style={{ left: `${playheadPosition.percent}%` }}
           />
-        ))}
+        )}
       </div>
 
       <p className="mt-3 text-[11px] leading-relaxed text-zinc-500">

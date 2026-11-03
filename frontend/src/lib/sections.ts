@@ -190,3 +190,50 @@ export function locateMixSegment(
   }
   return found;
 }
+
+export interface MixPlayhead {
+  timeSec: number;
+  segmentOrder: string[];
+  segmentStartSec: number[];
+  durationSec: number;
+}
+
+/**
+ * 成品播放位置 → 结构时间轴色块轨道上的位置。
+ * 色块宽度按 `durationSec` 分配，而成品里每段实际占用的长度是拼接后的长度（扣掉首部裁切与
+ * 交叉淡化重叠），所以先定位当前落在哪一段，再按段内比例换算回该色块的宽度占比。
+ * 未锁定的段落不参与成品，指针会直接跨过它们的色块。
+ */
+export function mixPlayheadPosition(
+  sections: TimelineSection[],
+  playhead: MixPlayhead,
+): { sectionId: string; percent: number } | null {
+  const total = sections.reduce((sum, section) => sum + section.durationSec, 0);
+  if (total <= 0 || playhead.durationSec <= 0) return null;
+
+  const located = locateMixSegment(
+    playhead.segmentOrder,
+    playhead.segmentStartSec,
+    Math.min(Math.max(playhead.timeSec, 0), playhead.durationSec),
+  );
+  if (!located) return null;
+
+  const index = sections.findIndex((section) => section.id === located.sectionId);
+  if (index < 0) return null;
+
+  const segmentIndex = playhead.segmentOrder.indexOf(located.sectionId);
+  const segmentStart = playhead.segmentStartSec[segmentIndex] ?? 0;
+  const segmentEnd =
+    segmentIndex + 1 < playhead.segmentStartSec.length
+      ? playhead.segmentStartSec[segmentIndex + 1]
+      : playhead.durationSec;
+  const segmentLength = Math.max(0.001, segmentEnd - segmentStart);
+  const withinSec = Math.min(Math.max(playhead.timeSec - segmentStart, 0), segmentLength);
+
+  const prefix = sections.slice(0, index).reduce((sum, section) => sum + section.durationSec, 0);
+  const block = sections[index].durationSec;
+  return {
+    sectionId: located.sectionId,
+    percent: ((prefix + (withinSec / segmentLength) * block) / total) * 100,
+  };
+}
