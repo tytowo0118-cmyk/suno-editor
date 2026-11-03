@@ -1,7 +1,8 @@
 """Suno 代理生成接口。
 
 浏览器只提交 `prompt`（风格提示 + [Section] 标签 + 本段歌词），后端负责：
-1. 把 prompt 拆成 Suno 的 tags 与歌词，提交 `/suno/submit/music`；
+1. 把 prompt 拆成 Suno 的 tags 与歌词，并做人声保底预处理（tags 去掉 `lo-fi` 并追加人声权重词，
+   歌词开头补 `[Verse 1]`、把 `[Intro]` / `[Instrumental]` 换掉），提交 `/suno/submit/music`；
 2. 每 5 秒轮询 `/suno/fetch/{task_id}`，直到任务完成；
 3. 下载远端音频，用 ffmpeg 统一转成 44.1 kHz 立体声 WAV 后返回二进制流。
 
@@ -63,6 +64,14 @@ SECTION_TAG = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 ANY_TAG_LINE = re.compile(r"^\[[^\]]+\]\s*$", re.MULTILINE)
+# 上游对 lo-fi 这类词很敏感，容易被带进纯器乐编曲
+LO_FI_WORD = re.compile(r"\blo-?fi\b", re.IGNORECASE)
+LEADING_TAG = re.compile(r"^\[[^\]]*\]")
+# 开头这些标记会让模型先铺一段无人声的前奏，续写/生成时统一换掉
+LEADING_EMPTY_HEAD_TAG = re.compile(r"^\[(?:intro|instrumental)\b[^\]]*\]", re.IGNORECASE)
+VOCAL_TAG_SUFFIX = "clear vocal, lead vocal, vocal-driven"
+VOCAL_HEAD_TAG = "[Verse 1]"
+DEFAULT_TAGS = "pop, modern"
 COMPLETE_STATES = {
     "COMPLETE",
     "COMPLETED",
@@ -126,6 +135,30 @@ def _split_prompt(prompt: str) -> tuple[str, str, bool]:
     lyrics = text[match.start() :].strip()
     lyric_text = ANY_TAG_LINE.sub("", lyrics).strip()
     return tags, lyrics, not lyric_text
+
+
+def _prepare_vocal_payload(tags: str, lyrics: str) -> tuple[str, str]:
+    """人声保底预处理：曲风标签去掉 lo-fi 并追加人声权重词，歌词补齐可演唱的结构标签。
+
+    Suno 在被 `lo-fi` 或 `[Intro]` / `[Instrumental]` 开头带偏时会直接忽略歌词出纯音乐，
+    这里在提交前把载荷掰回来；纯器乐（歌词只剩标签）由调用方挡掉，不走这条逻辑。
+    """
+    cleaned_tags = ", ".join(
+        re.sub(r"\s+", " ", part).strip(" 、")
+        for part in re.split(r"[,，;；]", LO_FI_WORD.sub(" ", tags))
+        if re.sub(r"\s+", " ", part).strip(" 、")
+    )
+    prepared_tags = ", ".join(filter(None, [cleaned_tags or DEFAULT_TAGS, VOCAL_TAG_SUFFIX]))
+
+    body = lyrics.strip()
+    head = LEADING_TAG.match(body)
+    if head is None:
+        # 完全没有段落标记时补一个，避免上游把整段文本当成描述而不是歌词
+        body = f"{VOCAL_HEAD_TAG}\n{body}"
+    elif LEADING_EMPTY_HEAD_TAG.match(head.group(0)):
+        body = VOCAL_HEAD_TAG + body[head.end() :]
+
+    return prepared_tags, body
 
 
 def _pick_str(data: Any, keys: tuple[str, ...]) -> Optional[str]:
@@ -274,12 +307,22 @@ async def _submit(
     continue_at: Optional[float] = None,
 ) -> str:
     tags, lyrics, instrumental = _split_prompt(prompt)
+    if not instrumental:
+        # 全曲生成与截断续写都走这里，续写同样容易被上游判成纯器乐
+        tags, lyrics = _prepare_vocal_payload(tags, lyrics)
     payload: dict[str, Any] = {
         "prompt": lyrics,
-        "tags": tags or "pop, modern",
+        "tags": tags or DEFAULT_TAGS,
         "make_instrumental": instrumental,
         "wait_audio": False,
     }
+    logger.info(
+        "suno payload prepared: instrumental=%s continue=%s tags=%r prompt_head=%r",
+        instrumental,
+        continue_clip_id or "-",
+        payload["tags"],
+        payload["prompt"][:32],
+    )
     model = os.environ.get("SUNO_MODEL", "").strip()
     if model:
         payload["model"] = model

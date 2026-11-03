@@ -255,6 +255,18 @@ curl -X POST http://127.0.0.1:8000/api/generate \
 
 1. **拆分 prompt**：第一个 `[Intro]` / `[Verse]` / `[Chorus]` 等标签之前的文本作为 `tags`，
    标签及其后的内容作为 `prompt`（歌词）；去掉标签后没有正文时置 `make_instrumental=true`。
+   - **人声保底预处理**（`_prepare_vocal_payload`，全曲与续写共用同一个提交入口 `_submit`，
+     两条路径都生效）：Suno 遇到 `lo-fi` 这类词或以 `[Intro]` / `[Instrumental]` 开头时，
+     常直接忽略歌词出一段纯音乐，因此提交前把 `tags` 里的 `lo-fi` / `lofi` 剔除
+     （按分隔符切开重组，顺手消掉多余空格与空片段）、末尾强制追加
+     `, clear vocal, lead vocal, vocal-driven`；歌词文本若开头没有中括号段落标记则补
+     `[Verse 1]\n`，若开头是 `[Intro]` / `[Instrumental]` 则替换成 `[Verse 1]`。
+     歌词只剩标签的纯器乐请求（续写留空歌词）不走这条预处理，保留用户主动要器乐的语义。
+     审计日志：`suno payload prepared: instrumental=… continue=… tags=… prompt_head=…`。
+     实测（`chirp-v3-5`，1 个真实任务）：带 `lo-fi` 的风格串被清成
+     `夜晚城市, 温暖克制的钢琴与柔和鼓点, …, clear vocal, lead vocal, vocal-driven`，
+     上游把它重写成含 `clear Chinese lead vocal … talk-sing …` 的人声描述，
+     双生两条片段（32.1s / 61.9s）的 `tags` 都带人声指向，`make_instrumental=false`。
 2. **提交任务**：`POST {SUNO_API_BASE}/suno/submit/music`，
    Header 注入 `Authorization: Bearer <SUNO_API_KEY>`，Payload 为
    `{ prompt, tags, make_instrumental, wait_audio: false }`（配置 `SUNO_MODEL` 时追加 `model`）；
