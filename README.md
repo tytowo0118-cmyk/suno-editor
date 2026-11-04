@@ -307,6 +307,26 @@ curl -X POST http://127.0.0.1:8000/api/generate \
 6. **下载与转码**：用 httpx 逐条下载上游音频到 `static/output/`，再用 ffmpeg 统一转成
    44.1 kHz / 立体声 / 16-bit WAV（文件名 `suno_<ts>_<rand>.wav`、`suno_<ts>_<rand>_1.wav` …），
    最后 `FileResponse(media_type="audio/wav")` 返回第一条；任一后续片段失败时回收已写盘的文件。
+   下载失败的 502 文案写异常类名、耗时与**已落盘字节数**——httpx 超时异常的 `str()` 是空串，
+   只内插异常本身只会剩下一个冒号；字节数则能区分「握手后没开始传」和「断流」。
+   下载本身也按 2s / 5s 退避、最多 3 次尝试，覆盖传输层异常与上游 `429 / 5xx`（同样幂等、不扣费）；
+   每次重试都重新以 `wb` 打开文件并把字节数归零，半截音频不会拼进新数据。48 MB 上限和不可重试的
+   4xx 直接失败，不消耗重试次数。
+   `/api/lyrics` 的 LLM 调用失败同样透出异常类名、耗时与目标端点。
+   - **三条重试路径的验证方式**（建单、轮询、下载共用一套办法，都不额外扣费）：
+     假 client 注入异常跑矩阵（提交 5 例、轮询 7 例、下载 7 例）、本地故障 HTTP 服务器回放已付费资产、
+     以及拿真实 CDN 地址复下已扣费片段。回放一例是「第 1 次只发 400000/5660462 字节就断连
+     （`RemoteProtocolError`，已落盘 393216 字节）→ 第 2 次 `503` → 第 3 次给完整音频」，
+     `_materialize` 产出 WAV 时长 32.088s 与源资产一致，总耗时 7.13s 即 2s + 5s 退避。
+     真实网络一例是把 `read` 压到 0.02s 打向 `cdn2.suno.show` 的已扣费片段地址：
+     两次 `ReadTimeout（已落盘 0 字节）` 后按「尝试 3/3」耗尽报
+     `下载 Suno 音频失败：ReadTimeout（10.0s / 已落盘 0 字节 / 尝试 3/3）`，不留半截文件；
+     同一地址改用正常超时 2.12s 下完 977252 字节。健康网络下一次真实生成全程不进重试分支
+     （建单 2.5s、出成品 31.8s、下载转码 6.0s，`transient failure` 日志 0 条），
+     所以重试必须靠上面两种注入才能验到。
+   - 重试发生时会打 WARNING，联调按这几个前缀 grep：`suno submit pre-send failure`、
+     `suno fetch <task_id> transient failure` / `suno fetch <task_id> upstream HTTP`、
+     `suno download <文件名> transient failure` / `suno download <文件名> upstream HTTP`。
 
 | 环境变量 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- |

@@ -12,6 +12,7 @@ import logging
 import os
 import random
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -268,6 +269,7 @@ async def _request_llm(prompt: str, seed: int) -> tuple[str, Optional[str]]:
         "max_tokens": 1200,
     }
     timeout = httpx.Timeout(connect=10.0, read=90.0, write=30.0, pool=10.0)
+    started = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
@@ -276,7 +278,14 @@ async def _request_llm(prompt: str, seed: int) -> tuple[str, Optional[str]]:
                 json=payload,
             )
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"无法连接 LLM 服务：{exc}") from exc
+        # httpx 的超时异常 str() 是空串，只内插 exc 会让文案只剩一个冒号，看不出卡在哪个阶段
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"无法连接 LLM 服务：{type(exc).__name__}"
+                f"（{time.perf_counter() - started:.1f}s，{base}/chat/completions）"
+            ),
+        ) from exc
 
     if response.status_code >= 400:
         detail = _upstream_detail(response.text, response.status_code)

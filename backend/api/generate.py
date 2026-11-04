@@ -48,10 +48,11 @@ UPSTREAM_LOG_LIMIT = 3000
 PRE_SEND_ERRORS = (httpx.ConnectTimeout, httpx.ConnectError, httpx.PoolTimeout)
 SUBMIT_RETRY_DELAYS = (1.0, 3.0)
 
-# 轮询走的是幂等 GET：既不建单也不扣费，所以传输层失败和上游 5xx / 429 都能安全重试。
+# 轮询和下载都是幂等 GET：既不建单也不扣费，所以传输层失败和上游 5xx / 429 能安全重试。
 # 一次网络抖动就作废整条已经扣费的任务，损失远大于多等几秒。
 POLL_RETRY_DELAYS = (1.0, 2.0, 4.0)
-RETRYABLE_POLL_STATUS = {429, 500, 502, 503, 504}
+DOWNLOAD_RETRY_DELAYS = (2.0, 5.0)
+RETRYABLE_UPSTREAM_STATUS = {429, 500, 502, 503, 504}
 
 
 def _log_upstream(label: str, response: httpx.Response) -> None:
@@ -462,7 +463,7 @@ async def _poll_once(
 
         _log_upstream(f"fetch {task_id}", response)
 
-        if response.status_code in RETRYABLE_POLL_STATUS:
+        if response.status_code in RETRYABLE_UPSTREAM_STATUS:
             if exhausted:
                 detail = _upstream_message(response.text) or f"HTTP {response.status_code}"
                 raise HTTPException(
@@ -542,22 +543,76 @@ async def _wait_for_audio(
 
 
 async def _download(client: httpx.AsyncClient, audio_url: str, destination: Path) -> None:
-    total = 0
-    try:
-        async with client.stream("GET", audio_url, follow_redirects=True) as response:
-            if response.status_code >= 400:
+    """把远端音频写到 destination，传输层失败与上游 5xx / 429 按 2s、5s 退避重试。
+
+    下载同样是幂等 GET、不再扣费，而这条音频所在的任务已经付过钱，一次断流就整单作废太亏。
+    每次重试都重新以 "wb" 打开文件并把字节数归零——半截音频必须从头重下，
+    否则残留的开头会拼进新数据，得到一个长度对但内容错位的 WAV。
+    """
+    started = time.perf_counter()
+    for attempt in range(len(DOWNLOAD_RETRY_DELAYS) + 1):
+        total = 0
+        exhausted = attempt >= len(DOWNLOAD_RETRY_DELAYS)
+        prefix = f"{attempt + 1}/{len(DOWNLOAD_RETRY_DELAYS) + 1}"
+        delay = 0.0 if exhausted else DOWNLOAD_RETRY_DELAYS[attempt]
+
+        try:
+            async with client.stream("GET", audio_url, follow_redirects=True) as response:
+                if response.status_code in RETRYABLE_UPSTREAM_STATUS:
+                    if exhausted:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=(
+                                f"下载 Suno 音频失败（HTTP {response.status_code}，"
+                                f"尝试 {prefix} / {time.perf_counter() - started:.1f}s）"
+                            ),
+                        )
+                    logger.warning(
+                        "suno download %s upstream HTTP %d, retry %s in %.1fs",
+                        destination.name,
+                        response.status_code,
+                        prefix,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                if response.status_code >= 400:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"下载 Suno 音频失败（HTTP {response.status_code}）",
+                    )
+
+                with destination.open("wb") as handle:
+                    async for chunk in response.aiter_bytes(64 * 1024):
+                        total += len(chunk)
+                        if total > MAX_DOWNLOAD_BYTES:
+                            raise HTTPException(status_code=502, detail="Suno 音频超过 48 MB 上限")
+                        handle.write(chunk)
+        except httpx.HTTPError as exc:
+            if exhausted:
                 raise HTTPException(
                     status_code=502,
-                    detail=f"下载 Suno 音频失败（HTTP {response.status_code}）",
-                )
-            with destination.open("wb") as handle:
-                async for chunk in response.aiter_bytes(64 * 1024):
-                    total += len(chunk)
-                    if total > MAX_DOWNLOAD_BYTES:
-                        raise HTTPException(status_code=502, detail="Suno 音频超过 48 MB 上限")
-                    handle.write(chunk)
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"下载 Suno 音频失败：{exc}") from exc
+                    detail=(
+                        f"下载 Suno 音频失败：{type(exc).__name__}"
+                        f"（{time.perf_counter() - started:.1f}s / 已落盘 {total} 字节 / 尝试 {prefix}）"
+                    ),
+                ) from exc
+            logger.warning(
+                "suno download %s transient failure: %s after %.1fs (%d 字节), retry %s in %.1fs",
+                destination.name,
+                type(exc).__name__,
+                time.perf_counter() - started,
+                total,
+                prefix,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        return
+
+    raise HTTPException(status_code=502, detail="下载 Suno 音频失败：未产生响应")
 
 
 def _ffmpeg_binary() -> str:
