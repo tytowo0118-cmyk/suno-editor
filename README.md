@@ -253,8 +253,15 @@ curl -X POST http://127.0.0.1:8000/api/generate \
 
 后端实现（`backend/api/generate.py`）：
 
-1. **拆分 prompt**：第一个 `[Intro]` / `[Verse]` / `[Chorus]` 等标签之前的文本作为 `tags`，
-   标签及其后的内容作为 `prompt`（歌词）；去掉标签后没有正文时置 `make_instrumental=true`。
+1. **拆分 prompt**：第一个「标签行」（整行只有一对 ASCII 中括号，如 `[Verse 1]` / `[Hook]` /
+   `[Instrumental]`）之前的文本作为 `tags`，标签及其后的内容作为 `prompt`（歌词）；
+   去掉标签行后没有正文时置 `make_instrumental=true`。
+   切分点与标签剔除共用 `TAG_LINE` 这一个模式定义，不再各写一份词表——早前切分只认
+   `intro/verse/pre-chorus/chorus/bridge/outro` 六个词，`[Hook]`、`[Instrumental]`、`[808 bass]`
+   这类标签找不到切分点，会把风格文本整段当歌词提交（`tags` 落到默认值），而剔除用的
+   `ANY` 模式又把这些行当标签，两处判定不一致正是纯器乐误判的来源之一。
+   只认 ASCII 方括号：`sectionTag()` 会先把中英标签归一成 `[Verse 1]` / `[Chorus]` 等英文形态，
+   `【副歌】` 这类写法仍按风格文本处理。
    - **人声保底预处理**（`_prepare_vocal_payload`，全曲与续写共用同一个提交入口 `_submit`，
      两条路径都生效）：Suno 遇到 `lo-fi` 这类词或以 `[Intro]` / `[Instrumental]` 开头时，
      常直接忽略歌词出一段纯音乐，因此提交前把 `tags` 里的 `lo-fi` / `lofi` 剔除
@@ -272,11 +279,23 @@ curl -X POST http://127.0.0.1:8000/api/generate \
    `{ prompt, tags, make_instrumental, wait_audio: false }`（配置 `SUNO_MODEL` 时追加 `model`）；
    携带续写参数时再追加 `continue_clip_id` 与 `continue_at`（秒，保留 3 位小数）。
    `continue_clip_id` 只允许 `[A-Za-z0-9_-]{1,64}`，否则返回 422。
+   - **建单前的退避重试**（`_post_submit`）：一段 3 个候选是并发提交的，上游网关忙时接入队列会排队，
+     TCP/TLS 握手在 `connect=10s` 内完不成抛 `ConnectTimeout`（实测 3 并发里 1 条进、2 条在 10.01s /
+     10.016s 整点失败）。这类请求的字节还没离开本机，重试不会重复建单扣费，因此按 1s、3s 退避最多再试
+     2 次（最坏 3 次尝试 / 约 34s）；`ReadTimeout`、`WriteTimeout` 等「可能已经送达上游」的失败**一律不重试**，
+     直接 502。异常类名与耗时都写进日志和 `detail`——httpx 的超时异常 `str()` 是空串，
+     此前 502 文案只剩一个光秃秃的冒号，看不出卡在哪个阶段。
 3. **轮询**：每 `SUNO_POLL_INTERVAL` 秒（默认 5）请求 `GET {SUNO_API_BASE}/suno/fetch/{task_id}`，
    直到 `status` 为 `COMPLETE` / `SUCCESS` 并拿到落定片段的 `audio_url`；`FAILED` / `ERROR` 立即失败，
    超过 `SUNO_TIMEOUT`（默认 300s）返回 504。解析函数 `_fetch_state` 返回
    `(status, 片段列表, 失败信息)`，片段列表按上游顺序保留**全部**已产出成品地址的片段，
    调用方按 `max_clips` 截取，不再只读 `data[0]`。
+   - **轮询容错**（`_poll_once`）：单次查询按 1s / 2s / 4s 退避、最多 4 次尝试，覆盖两类瞬时故障——
+     传输层异常（连接、读写、协议）和上游 `429 / 5xx`。轮询是幂等 GET，不建单也不扣费，所以重试
+     没有重复计费风险；而任务此时**已经建单扣费**，一次网络抖动就作废整条任务得不偿失。
+     不可重试的 4xx（401 / 404）直接失败，重试也救不回来。所有失败文案（含 5xx、上游 `FAILED`、
+     完成却无音频地址、504 超时）都带上 `task_id`，前端报错时能直接拿去人工复查。
+     一次轮询内部的重试最多消耗约 47s（4 次连接超时 + 7s 退避），仍受 `SUNO_TIMEOUT` 总预算约束。
 4. **兼容网关响应包**：第三方网关的业务码并不统一，成功形态可能是
    `{"code": 200, "data": {"task_id": "..."}}`，也可能是 `{"code": "success", "data": "task_xxx"}`
    （`data` 直接是任务 ID 字符串）；轮询结果里的片段还嵌了一层 `data.data[]`，其中

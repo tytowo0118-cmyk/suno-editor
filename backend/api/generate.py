@@ -43,6 +43,16 @@ logger = logging.getLogger(__name__)
 VERBOSE_LOG = os.environ.get("SUNO_VERBOSE_LOG", "").strip().lower() in {"1", "true", "yes"}
 UPSTREAM_LOG_LIMIT = 3000
 
+# 提交是扣费操作，只有「请求还没离开本机」的失败才允许重试：建单前的连接/连接池超时重复提交不会多扣费，
+# 而读写超时时上游可能已经建单，重试就是再花一次钱，所以这些一律直接失败。
+PRE_SEND_ERRORS = (httpx.ConnectTimeout, httpx.ConnectError, httpx.PoolTimeout)
+SUBMIT_RETRY_DELAYS = (1.0, 3.0)
+
+# 轮询走的是幂等 GET：既不建单也不扣费，所以传输层失败和上游 5xx / 429 都能安全重试。
+# 一次网络抖动就作废整条已经扣费的任务，损失远大于多等几秒。
+POLL_RETRY_DELAYS = (1.0, 2.0, 4.0)
+RETRYABLE_POLL_STATUS = {429, 500, 502, 503, 504}
+
 
 def _log_upstream(label: str, response: httpx.Response) -> None:
     if not VERBOSE_LOG:
@@ -59,11 +69,12 @@ router = APIRouter(prefix="/api", tags=["generation"])
 OUTPUT_DIR = STATIC_DIR / "output"
 MAX_DOWNLOAD_BYTES = 48 * 1024 * 1024
 
-SECTION_TAG = re.compile(
-    r"^\[(?:intro|verse|pre-chorus|prechorus|chorus|bridge|outro)[^\]]*\]\s*$",
-    re.IGNORECASE | re.MULTILINE,
-)
-ANY_TAG_LINE = re.compile(r"^\[[^\]]+\]\s*$", re.MULTILINE)
+# 标签行只有一个定义：整行就是一对中括号里的内容。同一个模式既用来找「风格 / 歌词」的切分点，
+# 也用来从歌词里剔除标签以判断是否纯器乐。此前切分点只认 intro/verse/… 六个固定词，
+# [Hook] / [Instrumental] / [808 bass] 找不到切分点，会把风格文本整段当歌词提交、
+# tags 落成默认值，而剔除用的 ANY 模式却把这些行当标签，两处判定不一致才产生纯器乐误判。
+# 仅认 ASCII 方括号：前端 sectionTag() 会把中英标签归一成 [Verse 1] / [Chorus] 等英文形态。
+TAG_LINE = re.compile(r"^\[[^\]\n]+\]\s*$", re.MULTILINE)
 # 上游对 lo-fi 这类词很敏感，容易被带进纯器乐编曲
 LO_FI_WORD = re.compile(r"\blo-?fi\b", re.IGNORECASE)
 LEADING_TAG = re.compile(r"^\[[^\]]*\]")
@@ -126,14 +137,14 @@ def _upstream() -> tuple[str, dict[str, str]]:
 def _split_prompt(prompt: str) -> tuple[str, str, bool]:
     """把「风格提示 + [Section] 歌词」拆成 Suno 的 tags / prompt / instrumental。"""
     text = prompt.strip()
-    match = SECTION_TAG.search(text)
+    match = TAG_LINE.search(text)
     if not match:
         # 没有结构标签时整段当歌词，风格留空由代理使用默认值
         return "", text, False
 
     tags = re.sub(r"\s+", " ", text[: match.start()]).strip(" ,;，；")
     lyrics = text[match.start() :].strip()
-    lyric_text = ANY_TAG_LINE.sub("", lyrics).strip()
+    lyric_text = TAG_LINE.sub("", lyrics).strip()
     return tags, lyrics, not lyric_text
 
 
@@ -298,6 +309,55 @@ def _fetch_state(payload: Any) -> tuple[str, list[dict[str, Any]], Optional[str]
     return status, clips, message
 
 
+async def _post_submit(
+    client: httpx.AsyncClient,
+    base: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+) -> httpx.Response:
+    """提交建单，只对建单前的连接失败退避重试。
+
+    一段 3 候选是并发提交的，上游网关忙时接入队列会排队，握手在 connect 超时（10s）内没完成
+    就抛 ConnectTimeout；这类请求根本没发出去，重试是安全的。读写超时时字节可能已经到达上游，
+    重试等于再扣一次费，因此不重试，直接把异常类名和耗时摊到错误信息里。
+    """
+    total_started = time.perf_counter()
+    for attempt in range(len(SUBMIT_RETRY_DELAYS) + 1):
+        attempt_started = time.perf_counter()
+        try:
+            return await client.post(f"{base}/suno/submit/music", headers=headers, json=payload)
+        except PRE_SEND_ERRORS as exc:
+            elapsed = time.perf_counter() - attempt_started
+            if attempt >= len(SUBMIT_RETRY_DELAYS):
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"无法连接 Suno 代理：{type(exc).__name__}"
+                        f"（尝试 {attempt + 1} 次 / {time.perf_counter() - total_started:.1f}s）"
+                    ),
+                ) from exc
+            delay = SUBMIT_RETRY_DELAYS[attempt]
+            logger.warning(
+                "suno submit pre-send failure: %s after %.2fs, retry %d/%d in %.1fs",
+                type(exc).__name__,
+                elapsed,
+                attempt + 1,
+                len(SUBMIT_RETRY_DELAYS),
+                delay,
+            )
+            await asyncio.sleep(delay)
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"无法连接 Suno 代理：{type(exc).__name__}"
+                    f"（{time.perf_counter() - attempt_started:.1f}s，已发出所以不重试）"
+                ),
+            ) from exc
+
+    raise HTTPException(status_code=502, detail="无法连接 Suno 代理：提交未产生响应")
+
+
 async def _submit(
     client: httpx.AsyncClient,
     base: str,
@@ -338,10 +398,7 @@ async def _submit(
             json.dumps(payload, ensure_ascii=False, sort_keys=True),
         )
 
-    try:
-        response = await client.post(f"{base}/suno/submit/music", headers=headers, json=payload)
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"无法连接 Suno 代理：{exc}") from exc
+    response = await _post_submit(client, base, headers, payload)
 
     _log_upstream("submit", response)
 
@@ -367,6 +424,69 @@ async def _submit(
     return task_id
 
 
+async def _poll_once(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    task_id: str,
+) -> httpx.Response:
+    """带退避地取一次任务状态；重试耗尽后把 task_id 摊进错误信息，方便人工接着查。"""
+    total_started = time.perf_counter()
+    for attempt in range(len(POLL_RETRY_DELAYS) + 1):
+        attempt_started = time.perf_counter()
+        exhausted = attempt >= len(POLL_RETRY_DELAYS)
+        prefix = f"{attempt + 1}/{len(POLL_RETRY_DELAYS) + 1}"
+        delay = 0.0 if exhausted else POLL_RETRY_DELAYS[attempt]
+
+        try:
+            response = await client.get(url, headers=headers)
+        except httpx.HTTPError as exc:
+            if exhausted:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"轮询 Suno 失败：{type(exc).__name__}"
+                        f"（task_id={task_id}，尝试 {prefix} / {time.perf_counter() - total_started:.1f}s）"
+                    ),
+                ) from exc
+            logger.warning(
+                "suno fetch %s transient failure: %s after %.2fs, retry %s in %.1fs",
+                task_id,
+                type(exc).__name__,
+                time.perf_counter() - attempt_started,
+                prefix,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        _log_upstream(f"fetch {task_id}", response)
+
+        if response.status_code in RETRYABLE_POLL_STATUS:
+            if exhausted:
+                detail = _upstream_message(response.text) or f"HTTP {response.status_code}"
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"Suno 查询失败（HTTP {response.status_code}，task_id={task_id}，"
+                        f"尝试 {prefix} / {time.perf_counter() - total_started:.1f}s）：{detail}"
+                    ),
+                )
+            logger.warning(
+                "suno fetch %s upstream HTTP %d, retry %s in %.1fs",
+                task_id,
+                response.status_code,
+                prefix,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        return response
+
+    raise HTTPException(status_code=502, detail=f"Suno 查询未产生响应：task_id={task_id}")
+
+
 async def _wait_for_audio(
     client: httpx.AsyncClient,
     base: str,
@@ -374,25 +494,24 @@ async def _wait_for_audio(
     task_id: str,
     max_clips: int = 1,
 ) -> list[dict[str, Any]]:
-    """轮询直到至少有一个片段落定，返回最多 max_clips 条 {clip_id, audio_url}。"""
+    """轮询直到至少有一个片段落定，返回最多 max_clips 条 {clip_id, audio_url}。
+
+    单次查询交给 `_poll_once` 做退避重试：任务已经建单扣费，不能被一次连接抖动或上游瞬时 5xx 作废。
+    """
     interval = max(0.05, _env_float("SUNO_POLL_INTERVAL", 5.0))
     timeout = max(10, _env_int("SUNO_TIMEOUT", 300))
     deadline = time.monotonic() + timeout
     url = f"{base}/suno/fetch/{urllib.parse.quote(task_id, safe='')}"
 
     while True:
-        try:
-            response = await client.get(url, headers=headers)
-        except httpx.HTTPError as exc:
-            raise HTTPException(status_code=502, detail=f"轮询 Suno 失败：{exc}") from exc
+        response = await _poll_once(client, url, headers, task_id)
 
-        _log_upstream(f"fetch {task_id}", response)
-
+        # 落到这里说明是 2xx 或不可重试的 4xx（401 / 404 之类，重试也救不回来）
         if response.status_code >= 400:
             detail = _upstream_message(response.text) or f"HTTP {response.status_code}"
             raise HTTPException(
                 status_code=502,
-                detail=f"Suno 查询失败（HTTP {response.status_code}）：{detail}",
+                detail=f"Suno 查询失败（HTTP {response.status_code}，task_id={task_id}）：{detail}",
             )
 
         try:
@@ -402,11 +521,17 @@ async def _wait_for_audio(
 
         status, clips, message = _fetch_state(body)
         if status in FAILED_STATES:
-            raise HTTPException(status_code=502, detail=f"Suno 生成失败：{message or status}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Suno 生成失败（task_id={task_id}）：{message or status}",
+            )
         if clips:
             return clips[:max_clips]
         if status in COMPLETE_STATES:
-            raise HTTPException(status_code=502, detail="Suno 任务已完成但没有返回音频地址")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Suno 任务已完成但没有返回音频地址：task_id={task_id}",
+            )
 
         if time.monotonic() >= deadline:
             raise HTTPException(
