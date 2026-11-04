@@ -49,6 +49,9 @@ class StitchResponse(BaseModel):
     segment_start_sec: List[float]
     # 每段拼接时物理剔除的头部静音（秒）；换算回源片段时间轴需要加回这段偏移
     head_trim_sec: List[float]
+    # 每段拼接时物理剔除的尾部静音（秒）；Suno 成品自带 0.06~1.96s 尾部数字静音，
+    # 不剔除就会留在接缝前面形成听感真空
+    tail_trim_sec: List[float]
 
 
 def _normalize_source(url: str) -> str:
@@ -69,7 +72,7 @@ def stitch_timeline(payload: StitchRequest, request: Request) -> StitchResponse:
     sources = [(_normalize_source(seg.audio_url), seg.crossfade_ms) for seg in payload.segments]
 
     try:
-        output_path, duration, peak_dbfs, segment_starts, head_trim = stitch_sequence(
+        output_path, duration, peak_dbfs, segment_starts, head_trim, tail_trim = stitch_sequence(
             sources, output_path=filename
         )
     except AudioSourceError as exc:
@@ -93,4 +96,5 @@ def stitch_timeline(payload: StitchRequest, request: Request) -> StitchResponse:
         segment_order=[seg.id for seg in payload.segments],
         segment_start_sec=[round(start, 3) for start in segment_starts],
         head_trim_sec=[round(sec, 3) for sec in head_trim],
+        tail_trim_sec=[round(sec, 3) for sec in tail_trim],
     )
