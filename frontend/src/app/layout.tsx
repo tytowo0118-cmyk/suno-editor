@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "MuseBlocks · 模块化 AI 音乐工作台",
-  description: "Web 端模块化 AI 音乐生成系统 — 歌词分段、逐段 3 选 1、Suno 整段人声、硬切拼接",
+  description: "Web 端模块化 AI 音乐生成系统 — 歌词分段、逐段 4 选 1、Suno 整段人声、硬切拼接",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

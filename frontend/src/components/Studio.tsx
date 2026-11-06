@@ -11,7 +11,13 @@ import {
   plannedTruncateSec,
   sectionTag,
 } from "@/lib/lyrics";
-import { GENERATE_ENDPOINT, generateTakes, revokeTakeAudio } from "@/lib/musicgen";
+import {
+  CANDIDATES_PER_SECTION,
+  GENERATE_ENDPOINT,
+  TASKS_PER_SECTION,
+  generateTakes,
+  revokeTakeAudio,
+} from "@/lib/musicgen";
 import {
   CROSSFADE_MS,
   DEFAULT_SONG_PROMPT,
@@ -141,7 +147,7 @@ export default function Studio() {
         sectionId,
         prompt,
         durationSec: section.durationSec,
-        count: 3,
+        count: TASKS_PER_SECTION,
       });
       if (epochRef.current !== epoch || requestSeq.current[sectionId] !== seq) {
         revokeTakeAudio(generated);
@@ -417,7 +423,7 @@ export default function Studio() {
               </div>
             </div>
             <p className="mt-4 max-w-xl text-sm leading-relaxed text-zinc-400">
-              先在创作设定里写歌词与风格提示词，确认后进入逐段生成：每段 3 个候选，
+              先在创作设定里写歌词与风格提示词，确认后进入逐段生成：每段 {CANDIDATES_PER_SECTION} 个候选，
               锁定后自动切到下一段，最后由后端按时间轴硬切拼接成品。
             </p>
           </div>
@@ -630,7 +636,10 @@ export default function Studio() {
 
                 <div className="mt-6 flex items-center justify-between gap-3">
                   <h3 className="text-xs font-medium text-zinc-300">
-                    生成结果 <span className="text-zinc-600">· 3 选 1</span>
+                    生成结果{" "}
+                    <span className="text-zinc-600">
+                      · {activeTakes.length || CANDIDATES_PER_SECTION} 选 1
+                    </span>
                   </h3>
                   {activeLoading && activeTakes.length > 0 && (
                     <span className="flex items-center gap-2 text-[10px] text-zinc-500">
@@ -640,9 +649,9 @@ export default function Studio() {
                   )}
                 </div>
 
-                <div className="mt-3 grid gap-4 md:grid-cols-3">
+                <div className="mt-3 grid gap-4 md:grid-cols-2">
                   {activeLoading && activeTakes.length === 0 ? (
-                    [0, 1, 2].map((index) => (
+                    Array.from({ length: CANDIDATES_PER_SECTION }, (_, index) => (
                       <div
                         key={index}
                         className="h-[248px] animate-pulse rounded-2xl border border-white/[0.06] bg-white/[0.03]"
@@ -650,7 +659,8 @@ export default function Studio() {
                     ))
                   ) : activeTakes.length === 0 && !activeError ? (
                     <div className="col-span-full rounded-2xl border border-dashed border-white/10 px-4 py-10 text-center text-xs text-zinc-500">
-                      暂无候选，点击「生成候选」请求 3 个 Take
+                      暂无候选，点击「生成候选」发 {TASKS_PER_SECTION} 次任务取{" "}
+                      {CANDIDATES_PER_SECTION} 个 Take
                     </div>
                   ) : (
                     activeTakes.map((take, index) => (

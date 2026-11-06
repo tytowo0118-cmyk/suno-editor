@@ -56,6 +56,15 @@ DOWNLOAD_RETRY_DELAYS = (2.0, 5.0)
 RETRYABLE_UPSTREAM_STATUS = {429, 500, 502, 503, 504}
 
 
+class PollTickLost(Exception):
+    """一次轮询 tick 的退避预算耗尽，没能问到任务状态。
+
+    实测上游代理会连续几十秒随机掐 TLS（2026-11-06 那轮 84 s 窗口里旁路 5 s 一轮只落到 4 个负载），
+    9.9 s 的阶梯必被击穿。任务已经建单扣费，所以「问不到」只该让这一次 tick 作废，
+    由 `_wait_for_audio` 睡到下一个轮询间隔继续问，直到 `SUNO_TIMEOUT` 总预算才算超时。
+    """
+
+
 def _log_upstream(label: str, response: httpx.Response) -> None:
     if not VERBOSE_LOG:
         return
@@ -431,25 +440,29 @@ async def _poll_once(
     url: str,
     headers: dict[str, str],
     task_id: str,
+    deadline: Optional[float] = None,
 ) -> httpx.Response:
-    """带退避地取一次任务状态；重试耗尽后把 task_id 摊进错误信息，方便人工接着查。"""
+    """带退避地取一次任务状态；退避预算耗尽只抛 `PollTickLost`，不判死已经扣费的任务。
+
+    `deadline` 是 `time.monotonic()` 时刻：退避一睡就要越过它时，这个 tick 当场作废，
+    否则阶梯会把总预算顶穿（实测 10s 预算跑到 14.4s）。
+    """
     total_started = time.perf_counter()
     for attempt in range(len(POLL_RETRY_DELAYS) + 1):
         attempt_started = time.perf_counter()
         exhausted = attempt >= len(POLL_RETRY_DELAYS)
         prefix = f"{attempt + 1}/{len(POLL_RETRY_DELAYS) + 1}"
         delay = 0.0 if exhausted else POLL_RETRY_DELAYS[attempt]
+        over_budget = not exhausted and deadline is not None and time.monotonic() + delay >= deadline
 
         try:
             response = await client.get(url, headers=headers)
         except httpx.HTTPError as exc:
-            if exhausted:
-                raise HTTPException(
-                    status_code=502,
-                    detail=(
-                        f"轮询 Suno 失败：{type(exc).__name__}"
-                        f"（task_id={task_id}，尝试 {prefix} / {time.perf_counter() - total_started:.1f}s）"
-                    ),
+            if exhausted or over_budget:
+                raise PollTickLost(
+                    f"{type(exc).__name__}（尝试 {prefix} / "
+                    f"{time.perf_counter() - total_started:.1f}s"
+                    f"{'，总预算用完' if over_budget else ''}）"
                 ) from exc
             logger.warning(
                 "suno fetch %s transient failure: %s after %.2fs, retry %s in %.1fs",
@@ -465,14 +478,12 @@ async def _poll_once(
         _log_upstream(f"fetch {task_id}", response)
 
         if response.status_code in RETRYABLE_UPSTREAM_STATUS:
-            if exhausted:
+            if exhausted or over_budget:
                 detail = _upstream_message(response.text) or f"HTTP {response.status_code}"
-                raise HTTPException(
-                    status_code=502,
-                    detail=(
-                        f"Suno 查询失败（HTTP {response.status_code}，task_id={task_id}，"
-                        f"尝试 {prefix} / {time.perf_counter() - total_started:.1f}s）：{detail}"
-                    ),
+                raise PollTickLost(
+                    f"HTTP {response.status_code}（尝试 {prefix} / "
+                    f"{time.perf_counter() - total_started:.1f}s"
+                    f"{'，总预算用完' if over_budget else ''}）：{detail}"
                 )
             logger.warning(
                 "suno fetch %s upstream HTTP %d, retry %s in %.1fs",
@@ -486,7 +497,7 @@ async def _poll_once(
 
         return response
 
-    raise HTTPException(status_code=502, detail=f"Suno 查询未产生响应：task_id={task_id}")
+    raise PollTickLost("未产生任何上游响应")
 
 
 async def _wait_for_audio(
@@ -498,15 +509,39 @@ async def _wait_for_audio(
 ) -> list[dict[str, Any]]:
     """轮询直到至少有一个片段落定，返回最多 max_clips 条 {clip_id, audio_url}。
 
-    单次查询交给 `_poll_once` 做退避重试：任务已经建单扣费，不能被一次连接抖动或上游瞬时 5xx 作废。
+    单次查询交给 `_poll_once` 做退避重试；重试预算耗尽只作废当前 tick，继续按
+    `SUNO_POLL_INTERVAL` 问到 `SUNO_TIMEOUT` 为止 —— 任务已经建单扣费，
+    不能因为代理掐了十几秒 TLS 就判死（实测见 README §2.3）。
     """
     interval = max(0.05, _env_float("SUNO_POLL_INTERVAL", 5.0))
     timeout = max(10, _env_int("SUNO_TIMEOUT", 300))
     deadline = time.monotonic() + timeout
     url = f"{base}/suno/fetch/{urllib.parse.quote(task_id, safe='')}"
+    lost_ticks = 0
 
     while True:
-        response = await _poll_once(client, url, headers, task_id)
+        try:
+            response = await _poll_once(client, url, headers, task_id, deadline)
+        except PollTickLost as lost:
+            lost_ticks += 1
+            if time.monotonic() >= deadline:
+                raise HTTPException(
+                    status_code=504,
+                    detail=(
+                        f"Suno 轮询在 {timeout}s 内问不到状态（task_id={task_id}，"
+                        f"作废 {lost_ticks} 次）：{lost}；任务已扣费，可用该 task_id 免费重查"
+                    ),
+                ) from lost
+            logger.warning(
+                "suno fetch %s tick lost #%d: %s，%.1fs 后接着问（剩 %.0fs 预算）",
+                task_id,
+                lost_ticks,
+                lost,
+                interval,
+                deadline - time.monotonic(),
+            )
+            await asyncio.sleep(interval)
+            continue
 
         # 落到这里说明是 2xx 或不可重试的 4xx（401 / 404 之类，重试也救不回来）
         if response.status_code >= 400:

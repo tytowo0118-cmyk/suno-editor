@@ -4,6 +4,15 @@ import type { Take } from "./types";
 /** FastAPI 后端的 Suno 代理端点：只接收 prompt，返回整段 WAV */
 export const GENERATE_ENDPOINT = `${API_BASE}/api/generate`;
 
+/** 后端 `MAX_CLIPS_PER_TASK = 2`：一次任务上游固定产 2 条双生，同价，不取回才是白扔 */
+export const CLIPS_PER_TASK = 2;
+
+/** 每段发几次任务。2 次 × 双生 = 4 个候选，比原来 3 次任务省一次扣费 */
+export const TASKS_PER_SECTION = 2;
+
+/** 一次「生成候选」预期的候选数，只用于界面文案与骨架屏 */
+export const CANDIDATES_PER_SECTION = TASKS_PER_SECTION * CLIPS_PER_TASK;
+
 /** 同一任务里第 2 个已扣费片段（双生），后端已下载转码为 /static 上的 WAV */
 interface ExtraClip {
   clipId: string | null;
@@ -159,8 +168,10 @@ async function generateOne(input: GenerateRequest): Promise<GeneratedAudio> {
 }
 
 /**
- * 生成一组候选：同一段 prompt 并发请求 count 次，每次返回一段完整 WAV。
- * 任一失败则回收已生成的 Blob URL 并抛错，避免内存泄漏。
+ * 生成一组候选：并发请求 `count` 次任务，每次任务的上游固定产 2 条双生片段，
+ * 主片段与 `extras` 全部挂载成候选 —— 第 2 条同样已扣费，扔掉它等于白付一半钱。
+ * 任一任务失败则回收已生成的 Blob URL 并抛错，避免内存泄漏；
+ * 只是某条双生取不回来时保留已挂载的候选，不作废整次生成。
  */
 export async function generateTakes(input: {
   sectionId: string;
@@ -169,12 +180,16 @@ export async function generateTakes(input: {
   count?: number;
   signal?: AbortSignal;
 }): Promise<Take[]> {
-  const count = input.count ?? 3;
-  const labels = ["A", "B", "C"];
+  const count = input.count ?? TASKS_PER_SECTION;
   const durationSec = Math.max(1, Math.round(input.durationSec));
   const settled = await Promise.allSettled(
     Array.from({ length: count }, () =>
-      generateOne({ prompt: input.prompt, durationSec, signal: input.signal }),
+      generateOne({
+        prompt: input.prompt,
+        durationSec,
+        signal: input.signal,
+        maxClips: CLIPS_PER_TASK,
+      }),
     ),
   );
 
@@ -190,13 +205,37 @@ export async function generateTakes(input: {
   }
 
   const stamp = Date.now().toString(36);
-  return generated.map((audio, index) => ({
-    id: `${input.sectionId}-${labels[index].toLowerCase()}-${stamp}`,
-    label: `Take ${labels[index]}`,
-    audioUrl: audio.url,
-    duration: audio.duration,
-    clipId: audio.clipId,
-  }));
+  const takes: Take[] = [];
+  // id 一律按候选序号取字母：双生曾经固定占 `-twin-` 这一格，同一次生成的两条双生 id 相同，
+  // 而 key={take.id} 与 lockedTakeId 都按 id 判同，锁一条双生会把两条一起标成已锁定。
+  const pushTake = (audioUrl: string, duration: number, clipId: string | null): void => {
+    const letter = String.fromCharCode(65 + takes.length);
+    takes.push({
+      id: `${input.sectionId}-${letter.toLowerCase()}-${stamp}`,
+      label: `Take ${letter}`,
+      audioUrl,
+      duration,
+      clipId,
+    });
+  };
+
+  for (const audio of generated) {
+    pushTake(audio.url, audio.duration, audio.clipId);
+    for (const extra of audio.extras) {
+      try {
+        const downloaded = await fetchExtraAudio(extra, input.signal);
+        pushTake(downloaded.url, downloaded.duration, downloaded.clipId);
+      } catch (error) {
+        if (input.signal?.aborted) {
+          revokeTakeAudio(takes);
+          throw error;
+        }
+        // 双生取不回来只是少一个候选，主片段已经扣过费且已经挂在上面了
+      }
+    }
+  }
+
+  return takes;
 }
 
 /**
