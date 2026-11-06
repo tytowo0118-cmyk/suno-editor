@@ -12,6 +12,7 @@ import {
   segmentLabelCn,
 } from "@/lib/sections";
 import type {
+  NoticeLevel,
   StitchResult,
   StructureCandidate,
   StructureJob,
@@ -30,7 +31,8 @@ interface WaveformExtendPlayerProps {
   onTakes: (sectionId: string, takes: Take[]) => void;
   /** 把续写点所在段落切到前台，便于试听新候选 */
   onActivate: (sectionId: string) => void;
-  onNotice: (message: string) => void;
+  /** 底部提示；省略 level 即 info（3.2s 自动消失），"error" 常驻到用户手动关闭 */
+  onNotice: (message: string, level?: NoticeLevel) => void;
   /** 成品播放进度（约 20Hz），用于让结构时间轴上的色块同步滑动指针 */
   onTimeUpdate?: (timeSec: number) => void;
 }
@@ -158,7 +160,7 @@ export default function WaveformExtendPlayer({
       return;
     }
     if (!targetTake.clipId) {
-      onNotice("该段音频缺少 Suno clip id（后端未回传），无法续写，请重新生成这一段");
+      onNotice("该段音频缺少 Suno clip id（后端未回传），无法续写，请重新生成这一段", "error");
       return;
     }
     if (target.offsetSec >= targetTake.duration - 0.5) {
@@ -191,7 +193,7 @@ export default function WaveformExtendPlayer({
           .join(" / ")}），试听后再决定是否锁定`,
       );
     } catch (error) {
-      onNotice(error instanceof Error ? `续写失败：${error.message}` : "续写失败");
+      onNotice(error instanceof Error ? `续写失败：${error.message}` : "续写失败", "error");
     } finally {
       setBusy(false);
     }

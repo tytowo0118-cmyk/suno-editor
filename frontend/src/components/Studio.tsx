@@ -23,7 +23,7 @@ import {
   DEFAULT_SONG_PROMPT,
   INITIAL_SECTIONS,
 } from "@/lib/sections";
-import type { StitchResult, Take, TimelineSection } from "@/lib/types";
+import type { Notice, NoticeLevel, StitchResult, Take, TimelineSection } from "@/lib/types";
 import SongBriefPanel from "./SongBriefPanel";
 import TakeCard from "./TakeCard";
 import Timeline from "./Timeline";
@@ -49,7 +49,7 @@ export default function Studio() {
   const [mix, setMix] = useState<StitchResult | null>(null);
   const [mixCurrentTime, setMixCurrentTime] = useState(0);
   const [stitching, setStitching] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
   const [songPrompt, setSongPrompt] = useState(DEFAULT_SONG_PROMPT);
   const [lyrics, setLyrics] = useState("");
   const [lyricsLoading, setLyricsLoading] = useState(false);
@@ -103,8 +103,13 @@ export default function Studio() {
   const hasStudioWork = () =>
     Object.keys(lockedRef.current).length > 0 || Object.keys(takesRef.current).length > 0;
 
+  const notify = useCallback((text: string, level: NoticeLevel = "info") => {
+    setNotice({ text, level });
+  }, []);
+
   useEffect(() => {
-    if (!notice) return;
+    // 只有 info 走自动消失；error 常驻到用户手动关闭 —— 3.2s 抹掉的往往是唯一证据
+    if (!notice || notice.level !== "info") return;
     const timer = window.setTimeout(() => setNotice(null), 3200);
     return () => window.clearTimeout(timer);
   }, [notice]);
@@ -165,13 +170,13 @@ export default function Studio() {
       if (epochRef.current !== epoch || requestSeq.current[sectionId] !== seq) return;
       const message = error instanceof Error ? error.message : "生成候选失败";
       setErrors((prev) => ({ ...prev, [sectionId]: message }));
-      setNotice(message);
+      notify(message, "error");
     } finally {
       if (epochRef.current === epoch && requestSeq.current[sectionId] === seq) {
         setLoading((prev) => ({ ...prev, [sectionId]: false }));
       }
     }
-  }, [applyNaturalDuration]);
+  }, [applyNaturalDuration, notify]);
 
   const applyStructure = (nextSections: TimelineSection[], nextLyrics: string, message: string) => {
     Object.values(takesRef.current).forEach(revokeTakeAudio);
@@ -197,17 +202,17 @@ export default function Studio() {
     setLyrics(nextLyrics);
     setLyricsError(null);
     pauseAllAudio();
-    setNotice(message);
+    notify(message);
   };
 
   const handleConfirmBrief = () => {
     const text = lyrics.trim();
     if (!text) {
-      setNotice("请先输入歌词，或点击「AI 生成歌词」");
+      notify("请先输入歌词，或点击「AI 生成歌词」");
       return;
     }
     if (briefPreview.error || briefPreview.sections.length === 0) {
-      setNotice(briefPreview.error ?? "没有解析出歌词段落，请检查文本格式");
+      notify(briefPreview.error ?? "没有解析出歌词段落，请检查文本格式");
       return;
     }
 
@@ -227,7 +232,7 @@ export default function Studio() {
       });
     if (unchanged) {
       setStep("studio");
-      setNotice("设定未变化，回到逐段生成");
+      notify("设定未变化，回到逐段生成");
       return;
     }
 
@@ -256,7 +261,7 @@ export default function Studio() {
     try {
       const draft = await requestLyrics(songPrompt);
       setLyrics(draft.lyrics);
-      setNotice(
+      notify(
         hasStudioWork()
           ? "歌词已生成，重新确认会清空现有候选与锁定"
           : "歌词已生成，确认分段预览后进入逐段生成",
@@ -272,7 +277,7 @@ export default function Studio() {
     if (step !== "studio") return;
     pauseAllAudio();
     setStep("brief");
-    setNotice("已返回创作设定；设定不变时可直接回到逐段生成");
+    notify("已返回创作设定；设定不变时可直接回到逐段生成");
   };
 
   const handleStepClick = (target: StudioStep) => {
@@ -301,7 +306,7 @@ export default function Studio() {
     setSections(next);
     pauseAllAudio();
     setMix(null);
-    setNotice("结构已调整，拼接顺序按新顺序生效");
+    notify("结构已调整，拼接顺序按新顺序生效");
   };
 
   const handleLock = async (sectionId: string, take: Take) => {
@@ -315,7 +320,7 @@ export default function Studio() {
       try {
         stored = { ...take, audioUrl: await persistAudio(take.audioUrl) };
       } catch (error) {
-        setNotice(error instanceof Error ? `保存音频失败：${error.message}` : "保存音频失败");
+        notify(error instanceof Error ? `保存音频失败：${error.message}` : "保存音频失败", "error");
         return;
       }
     }
@@ -333,11 +338,11 @@ export default function Studio() {
     if (nextSection) {
       // 正常流程：确定当前段后，生成框自动切到下一段
       setActiveId(nextSection.id);
-      setNotice(
+      notify(
         `已锁定「${section.title} · ${stored.label}」，已切换到「${nextSection.title}」`,
       );
     } else {
-      setNotice(
+      notify(
         `已锁定「${section.title} · ${stored.label}」，全部段落已锁定，可以生成成品了`,
       );
     }
@@ -360,7 +365,7 @@ export default function Studio() {
     });
 
     if (sequence.length < 2) {
-      setNotice("至少锁定 2 个段落才能拼接");
+      notify("至少锁定 2 个段落才能拼接");
       return;
     }
 
@@ -380,12 +385,12 @@ export default function Studio() {
       setMix(result);
       setMixCurrentTime(0);
       const cutCount = result.truncateToSec.filter((sec) => sec != null).length;
-      setNotice(
+      notify(
         `成品已生成：${result.duration.toFixed(2)}s · 峰值 ${result.peakDbfs.toFixed(1)} dBFS` +
           (cutCount > 0 ? ` · ${cutCount} 个无词段落已裁到规划时长` : ""),
       );
     } catch (error) {
-      setNotice(error instanceof Error ? `拼接失败：${error.message}` : "拼接失败");
+      notify(error instanceof Error ? `拼接失败：${error.message}` : "拼接失败", "error");
     } finally {
       setStitching(false);
     }
@@ -767,7 +772,7 @@ export default function Studio() {
                         }))
                       }
                       onActivate={setActiveId}
-                      onNotice={setNotice}
+                      onNotice={notify}
                       onTimeUpdate={setMixCurrentTime}
                     />
                   </div>
@@ -786,10 +791,23 @@ export default function Studio() {
 
       {notice && (
         <div
-          role="status"
-          className="toast-enter fixed bottom-5 left-1/2 z-50 max-w-[90vw] -translate-x-1/2 rounded-2xl border border-white/15 bg-zinc-900/95 px-4 py-2 text-center text-xs text-zinc-200 shadow-2xl backdrop-blur"
+          role={notice.level === "error" ? "alert" : "status"}
+          className={`toast-enter fixed bottom-5 left-1/2 z-50 flex max-w-[90vw] -translate-x-1/2 items-center gap-3 rounded-2xl border px-4 py-2 text-xs shadow-2xl backdrop-blur ${
+            notice.level === "error"
+              ? "border-rose-400/40 bg-rose-400/10 text-rose-200"
+              : "border-white/15 bg-zinc-900/95 text-zinc-200"
+          }`}
         >
-          {notice}
+          <span className="text-left">{notice.text}</span>
+          {notice.level === "error" && (
+            <button
+              type="button"
+              onClick={() => setNotice(null)}
+              className="shrink-0 rounded-lg border border-rose-300/30 px-2 py-0.5 text-[10px] text-rose-300 transition hover:border-rose-300/70 hover:text-rose-200"
+            >
+              关闭
+            </button>
+          )}
         </div>
       )}
     </div>

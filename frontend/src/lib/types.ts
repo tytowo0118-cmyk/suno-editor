@@ -79,3 +79,16 @@ export interface StructureJob {
   reused: boolean;
   model: string;
 }
+
+/**
+ * 底部提示的两种级别，判据是「谁没做到该做的事」。
+ * info 是用户操作还没满足条件或纯反馈，3.2s 自动消失没关系；
+ * error 是我们这边失败了 —— 网络、后端、扣费相关的丢失，一闪而过就等于把证据藏起来，
+ * 所以常驻到用户手动关闭（413 拒掉已扣费音频那轮就是被自动消失坑的，见 README §2.4）。
+ */
+export type NoticeLevel = "info" | "error";
+
+export interface Notice {
+  text: string;
+  level: NoticeLevel;
+}
