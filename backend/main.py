@@ -18,6 +18,7 @@ from api.assets import router as assets_router
 from api.generate import router as generate_router
 from api.lyrics import router as lyrics_router
 from api.stitch import router as stitch_router
+from api.structure import router as structure_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,6 +53,7 @@ app.include_router(assets_router)
 app.include_router(generate_router)
 app.include_router(lyrics_router)
 app.include_router(stitch_router)
+app.include_router(structure_router)
 
 
 @app.get("/")

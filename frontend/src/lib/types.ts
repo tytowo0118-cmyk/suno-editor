@@ -37,10 +37,45 @@ export interface StitchResult {
   segmentStartSec: number[];
   /** 拼接时物理剔除的每段头部静音秒数，换算回源片段自身时间轴要加回来 */
   headTrimSec: number[];
+  /** 每段按 maxDurationSec 实际裁保留的秒数；null = 这段没裁（不超限或没给上限） */
+  truncateToSec: (number | null)[];
 }
 
 /** 某一秒段相对整条时间轴的起止位置 */
 export interface SectionTiming {
   startSec: number;
   endSec: number;
+}
+
+/** 结构候选：sec 是成品时间轴上的秒数。strength 是谱新颖度（仅检测器给），
+ *  source 标出这条证据来自哪里 —— 检测器定位到毫秒但没有语义，模型带语义标签但只到 ±0.1~0.5 s。 */
+export interface StructureCandidate {
+  sec: number;
+  strength: number;
+  source?: "detector" | "model";
+}
+
+/** 深度学习结构模型的分段：带 intro/verse/chorus 语义标签，边界定位精度 ±0.1~0.5 s */
+export interface StructureSegment {
+  label: string;
+  start: number;
+  end: number;
+}
+
+export type StructureJobStatus = "queued" | "running" | "done" | "failed";
+
+/** 结构分析任务：提交后轮询，终态是 done / failed（failed 也带一段兜底区间） */
+export interface StructureJob {
+  jobId: string;
+  clipId: string;
+  filename: string;
+  status: StructureJobStatus;
+  final: boolean;
+  durationSec: number;
+  segments: StructureSegment[];
+  elapsedSec: number;
+  analyzeMs?: number;
+  detail?: string;
+  reused: boolean;
+  model: string;
 }

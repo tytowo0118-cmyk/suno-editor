@@ -1,4 +1,9 @@
-import type { SectionKind, TimelineSection } from "./types";
+import type {
+  SectionKind,
+  StructureCandidate,
+  StructureSegment,
+  TimelineSection,
+} from "./types";
 
 export interface SectionStyle {
   accent: string;
@@ -169,6 +174,41 @@ export function buildTimings(sections: TimelineSection[]) {
 }
 
 /**
+ * 播放头吸附窗（秒）。
+ *
+ * 窗口不能按检测误差来定（候选自身 MAE 只有 0.062s，±0.25s 反而是亚像素、点不中），
+ * 它是「误吸率」与「可点性」的折中：波形把整条时间轴压扁进容器宽度，落点只有像素那么粗。
+ * 实测容器 477px：75s 成品 0.157s/px（窗口≈6px，好点）；492s 成品 1.031s/px（窗口≈1px，
+ * 相邻像素一个吸一个不吸）。0.5s 把候选覆盖从 11.1% 压到 6.0%，代价是瞄准接缝±1像素的
+ * 21 次点击只吸中 12 次（1.0s 时 19 次）。长成品点不中不该靠放大这个常数来救，
+ * 而是用成品波形的横向缩放（×4 → 0.258s/px、窗口≈3.9px；×8 → 0.129s/px、窗口≈7.8px）。
+ */
+export const SNAP_WINDOW_SEC = 0.5;
+
+/**
+ * 把落点吸附到窗口内最近的候选边界。吸附窗口不区分来源（检测候选和模型边界一起吃），
+ * 但**不**吸附 clip 级段边界：段边界在结构时间轴上就是色块分界，看得见；
+ * 而且吸附到段起点会让续写点变成「该段第 0 秒」，正好撞上 continue_at 的 0.2s 下界被拒。
+ */
+export function snapToCandidates(
+  timeSec: number,
+  candidates: StructureCandidate[],
+  windowSec: number = SNAP_WINDOW_SEC,
+): { sec: number; snapped: boolean; fromSec: number } {
+  let best: number | null = null;
+  let bestDist = Infinity;
+  for (const candidate of candidates) {
+    const dist = Math.abs(candidate.sec - timeSec);
+    if (dist <= windowSec && dist < bestDist) {
+      best = candidate.sec;
+      bestDist = dist;
+    }
+  }
+  if (best == null) return { sec: timeSec, snapped: false, fromSec: timeSec };
+  return { sec: best, snapped: true, fromSec: timeSec };
+}
+
+/**
  * 成品时间轴上的某一秒段 → 它落在哪个源片段、片段内偏移多少秒。
  * 起点由后端拼接时按实际重叠样本量算出，因此这里直接二分式地找最后一个不超过该点的段。
  * 拼接会物理剔除源片段头部静音，所以偏移要加回这段垫片，才能对回源片段自身的时间轴（续写用）。
@@ -236,4 +276,55 @@ export function mixPlayheadPosition(
     sectionId: located.sectionId,
     percent: ((prefix + (withinSec / segmentLength) * block) / total) * 100,
   };
+}
+
+/** 模型边界与检测候选重合到这个精度以内就只留检测候选那条（它定位更准）。 */
+const MERGE_DEDUPE_SEC = 0.05;
+
+/** 模型段 → 内部边界秒数：首段起点恒为 0，那是文件头不是可裁切的内部接缝。 */
+export function structureBoundarySec(segments: StructureSegment[]): number[] {
+  return segments.slice(1).map((segment) => segment.start);
+}
+
+/**
+ * 吸附目标 = 检测候选 ∪ 模型段边界。
+ *
+ * 曾经的做法是反过来用模型边界「收窄」检测候选，实测否决了：dlp-B（127.887 s，2 条毫秒真值接缝）
+ * 上模型的第二个边界比检测器晚 4.42 s（96.99 vs 真值 92.567），±1 s 的收窄窗把检测器在那条
+ * 接缝上唯一吸得上的候选（92.944，误差 0.377 s）连坐删掉 —— 收窄窗 0.5/1/2 s 三档的
+ * 「真接缝存活率」都是 0/2，而检测器自己本来是 1/2。减候选数减掉的是真边界，那不是降噪是截肢。
+ *
+ * 并集才讲得通：这个模型的边界误差比检测器**不稳**（0.125 s 与 4.42 s 同时出现在一首歌里），
+ * 但它是那条 31.375 s 接缝上唯一存在的证据（检测器最近候选差 2.53 s，模型给的 31.50 差 0.125 s）。
+ * 两边各有各看不见的接缝，取并集后 dlp-B 的 ±0.5 s 可吸接缝从 1/2 变 2/2。
+ * 语义标签另有一用：波形下方的分段色带读的是段，不是点。
+ */
+export function mergeSnapPoints(
+  candidates: StructureCandidate[],
+  segments: StructureSegment[],
+): StructureCandidate[] {
+  const boundaries = structureBoundarySec(segments).filter(
+    (sec) => candidates.every((candidate) => Math.abs(candidate.sec - sec) > MERGE_DEDUPE_SEC),
+  );
+  return [
+    ...candidates,
+    ...boundaries.map((sec) => ({ sec, strength: 0, source: "model" as const })),
+  ].sort((a, b) => a.sec - b.sec);
+}
+
+/** 语义标签的展示用语：模型的 harmonix 标签读起来是数据集名，不是音乐用语。 */
+const SEGMENT_LABEL_CN: Record<string, string> = {
+  intro: "前奏",
+  verse: "主歌",
+  chorus: "副歌",
+  bridge: "桥段",
+  instrumental: "器乐",
+  outro: "尾奏",
+  break: "间奏",
+  solo: "独奏",
+  section: "段落",
+};
+
+export function segmentLabelCn(label: string): string {
+  return SEGMENT_LABEL_CN[label] ?? label;
 }

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -20,12 +21,16 @@ import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from api.generate import PRE_SEND_ERRORS
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["lyrics"])
 
 MAX_LYRICS_CHARS = 6000
 DEFAULT_LLM_MODEL = "gpt-4o-mini"
+# 只重试「请求还没离开本机」的失败，判据与 Suno 建单共用 api.generate.PRE_SEND_ERRORS
+LLM_RETRY_DELAYS = (1.0, 3.0)
 ALLOWED_TAG = re.compile(
     r"^\[(?:intro|verse|pre-chorus|prechorus|chorus|bridge|outro)(?:\s*\d+)?\]\s*$",
     re.IGNORECASE,
@@ -245,6 +250,64 @@ def _lyrics_valid(text: str) -> bool:
     )
 
 
+async def _post_chat_completions(base: str, key: str, payload: dict) -> httpx.Response:
+    """打一发 chat/completions，只对「请求还没离开本机」的失败退避重试。
+
+    歌词是按 token 扣费的，判据跟 Suno 建单那条完全一样（`api.generate.PRE_SEND_ERRORS`）：
+    ConnectError / ConnectTimeout / PoolTimeout 时字节根本没到上游，重试不多花钱；
+    读写超时时上游可能已经算完了，重试就是再买一次，所以一律直接失败。
+
+    实测本机代理（`key.34ku.com` 的 DNS 落到 198.18.x 的 fake-IP）会在 TLS 握手中途掐连接，
+    表现是 `ConnectError: [SSL: UNEXPECTED_EOF_WHILE_READING]`，**0.62 s 就返回**；
+    同一发 GET 连打 10 次能 10/10 通（0.02 s DNS + 1.3~1.5 s 握手），说明是随机掐而不是配置坏了。
+    所以这种失败值得重试两次，而不是把 0.6 s 的一次抖动摊成用户眼前的 502。
+    """
+    timeout = httpx.Timeout(connect=10.0, read=90.0, write=30.0, pool=10.0)
+    total_started = time.perf_counter()
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for attempt in range(len(LLM_RETRY_DELAYS) + 1):
+            attempt_started = time.perf_counter()
+            try:
+                return await client.post(
+                    f"{base}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+            except PRE_SEND_ERRORS as exc:
+                # 握手被掐这类要能看出是哪一步：异常类名之外再带上被截断的原文
+                if attempt >= len(LLM_RETRY_DELAYS):
+                    raise HTTPException(
+                        status_code=502,
+                        detail=(
+                            f"无法连接 LLM 服务：{type(exc).__name__}: {str(exc)[:90]}"
+                            f"（尝试 {attempt + 1} 次 / "
+                            f"{time.perf_counter() - total_started:.1f}s，{base}/chat/completions）"
+                        ),
+                    ) from exc
+                logger.warning(
+                    "lyrics LLM pre-send failure: %s after %.2fs, retry %d/%d in %.1fs",
+                    type(exc).__name__,
+                    time.perf_counter() - attempt_started,
+                    attempt + 1,
+                    len(LLM_RETRY_DELAYS),
+                    LLM_RETRY_DELAYS[attempt],
+                )
+                await asyncio.sleep(LLM_RETRY_DELAYS[attempt])
+            except httpx.HTTPError as exc:
+                # httpx 的超时异常 str() 是空串，只内插 exc 会让文案只剩一个冒号，看不出卡在哪个阶段
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"无法连接 LLM 服务：{type(exc).__name__}"
+                        f"（{time.perf_counter() - total_started:.1f}s，{base}/chat/completions）"
+                    ),
+                ) from exc
+    raise AssertionError("unreachable")  # 循环每轮要么 return 要么 raise
+
+
 async def _request_llm(prompt: str, seed: int) -> tuple[str, Optional[str]]:
     config = _llm_config()
     if config is None:
@@ -268,24 +331,7 @@ async def _request_llm(prompt: str, seed: int) -> tuple[str, Optional[str]]:
         "temperature": 0.9,
         "max_tokens": 1200,
     }
-    timeout = httpx.Timeout(connect=10.0, read=90.0, write=30.0, pool=10.0)
-    started = time.perf_counter()
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                f"{base}/chat/completions",
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json=payload,
-            )
-    except httpx.HTTPError as exc:
-        # httpx 的超时异常 str() 是空串，只内插 exc 会让文案只剩一个冒号，看不出卡在哪个阶段
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"无法连接 LLM 服务：{type(exc).__name__}"
-                f"（{time.perf_counter() - started:.1f}s，{base}/chat/completions）"
-            ),
-        ) from exc
+    response = await _post_chat_completions(base, key, payload)
 
     if response.status_code >= 400:
         detail = _upstream_detail(response.text, response.status_code)

@@ -8,6 +8,7 @@ import {
   buildGenerationPrompt,
   buildSectionsFromLyrics,
   parseLyricBlocks,
+  plannedTruncateSec,
   sectionTag,
 } from "@/lib/lyrics";
 import { GENERATE_ENDPOINT, generateTakes, revokeTakeAudio } from "@/lib/musicgen";
@@ -365,11 +366,18 @@ export default function Studio() {
           id: section.id,
           audioUrl: take.audioUrl,
           crossfadeMs: CROSSFADE_MS,
+          // 无歌词段（make_instrumental=true）上游会写满一整首，按规划秒数裁到段长；
+          // 有歌词的段落时长由唱词决定，裁在乐句中间比留长尾更糟，所以不裁
+          maxDurationSec: plannedTruncateSec(section),
         })),
       );
       setMix(result);
       setMixCurrentTime(0);
-      setNotice(`成品已生成：${result.duration.toFixed(2)}s · 峰值 ${result.peakDbfs.toFixed(1)} dBFS`);
+      const cutCount = result.truncateToSec.filter((sec) => sec != null).length;
+      setNotice(
+        `成品已生成：${result.duration.toFixed(2)}s · 峰值 ${result.peakDbfs.toFixed(1)} dBFS` +
+          (cutCount > 0 ? ` · ${cutCount} 个无词段落已裁到规划时长` : ""),
+      );
     } catch (error) {
       setNotice(error instanceof Error ? `拼接失败：${error.message}` : "拼接失败");
     } finally {

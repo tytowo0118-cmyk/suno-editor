@@ -12,6 +12,8 @@
 - 统一采样率 / 声道 / 位深后再混音；
 - 非首段先做首部静音裁切（默认 -50 dBFS 帧能量阈值）：续写音频头部带约 270ms 数字静音，
   直接交叉淡化会在交接点形成听感真空；
+- 可选的按段时长上限（`max_durations`）：Suno 不吃时长参数，纯器乐段会写满一整首，
+  超长部分在这里物理截掉，切点吸附到结构边界候选而不是硬停在秒数上；
 - 终混仅做峰值衰减（默认 -1 dBFS），不软削波、不压限，保留动态。
 """
 
@@ -29,6 +31,8 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 from pydub import AudioSegment
 
+from utils import structure_detector
+
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -44,6 +48,8 @@ DEFAULT_EDGE_FADE_MS = 12
 DEFAULT_PEAK_DBFS = -1.0
 # Suno 续写音频头部带约 270ms 数字静音，直接交叉淡化会听感断层，按帧能量剔除
 HEAD_TRIM_THRESHOLD_DBFS = -50.0
+# 按时长裁段时，切点允许在目标秒数前后各吸附的窗口；与前端吸附窗同一口径
+CUT_SNAP_SEC = 0.5
 MAX_DOWNLOAD_BYTES = 60 * 1024 * 1024
 
 DEFAULT_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -144,6 +150,14 @@ def _load_audio(source: str) -> Tuple[np.ndarray, int, Optional[Path]]:
         raise
 
 
+def read_audio(source: str) -> Tuple[np.ndarray, int]:
+    """对外暴露的读取入口：统一成 float32 [n, 2] 后立即释放下载得到的临时文件。"""
+    samples, frame_rate, temp_path = _load_audio(source)
+    if temp_path is not None:
+        temp_path.unlink(missing_ok=True)
+    return samples, frame_rate
+
+
 def _equal_power_curves(length: int) -> Tuple[np.ndarray, np.ndarray]:
     """等功率交叉淡化曲线。
 
@@ -200,6 +214,69 @@ def _trim_tail_silence(current: np.ndarray, threshold_dbfs: float) -> Tuple[np.n
     if end >= current.shape[0]:
         return current, 0
     return current[:end], current.shape[0] - end
+
+
+def _truncate_to_length(
+    samples: np.ndarray,
+    sample_rate: int,
+    max_sec: Optional[float],
+    snap_sec: float = CUT_SNAP_SEC,
+) -> Tuple[np.ndarray, Optional[float], bool]:
+    """超长素材物理截到 max_sec，切点优先吸附到结构边界候选。
+
+    「这一段要 8 秒」没别的地方能兑现：Suno 载荷里根本没有时长字段（New API 的
+    `/suno/submit/music` 只认 prompt / mv / title / tags / make_instrumental /
+    task_id / continue_at / continue_clip_id / gpt_description_prompt / notify_hook），
+    纯器乐 + 空歌词上游一律写满一整首，实测 177~193s。
+
+    切点不硬停在 max_sec 上：先在该点前后 `snap_sec` 内取最近的谱形状新颖度候选 ——
+    候选的定位精度实测 MAE 0.062s（floor 0.09 / gap 1.0s，见 README 检测器标定），
+    比按秒表瞎切可靠；窗内没有候选就回到 max_sec 本身。代价是切点可能比目标长 ≤0.5s。
+
+    只探测 `max_sec + snap_sec + max(WINDOW_SEC, GUARD_SEC)` 这一段：候选出不了这个范围，
+    全曲扫描是白花时间（检测器实测 182.378s 整首要 787.5ms，9.5s 探针只要 13.1ms）。
+    探针右边界必须让出 WINDOW_SEC：`novelty_curve` 的 `index <= total - window_frames`
+    要求切点右侧凑满一整个 2s 块，只让 GUARD_SEC 会把窗口右半边的候选全吃掉 ——
+    实测 27.5s 目标配 29.0s 探针时 27.777s 的候选消失，探针改 30.0s 才回来。
+
+    Returns:
+        (裁后音频, 保留的秒数 —— 没裁就是 None, 切点是否吸到了候选)
+    """
+    if max_sec is None or max_sec <= 0:
+        return samples, None, False
+    limit_samples = int(round(max_sec * sample_rate))
+    if samples.shape[0] <= limit_samples:
+        return samples, None, False
+
+    probe_end = min(
+        samples.shape[0],
+        limit_samples
+        + int(
+            round(
+                (snap_sec + max(structure_detector.WINDOW_SEC, structure_detector.GUARD_SEC))
+                * sample_rate
+            )
+        ),
+    )
+    candidates = structure_detector.boundary_candidates(samples[:probe_end], sample_rate)
+    nearby = [moment for moment, _ in candidates if abs(moment - max_sec) <= snap_sec]
+    snapped = bool(nearby)
+    cut_sec = min(nearby, key=lambda moment: abs(moment - max_sec)) if snapped else max_sec
+    kept = min(max(int(round(cut_sec * sample_rate)), 1), samples.shape[0])
+    if kept >= samples.shape[0]:
+        return samples, None, False
+    logger.info(
+        "duration_truncated: kept=%.3fs target=%.3fs cut=%.3fs snapped=%s discarded=%.3fs "
+        "(probe=%.3fs candidates=%d)",
+        kept / float(sample_rate),
+        max_sec,
+        cut_sec,
+        snapped,
+        (samples.shape[0] - kept) / float(sample_rate),
+        probe_end / float(sample_rate),
+        len(candidates),
+    )
+    return samples[:kept], round(kept / float(sample_rate), 3), snapped
 
 
 def _apply_edge_fade(samples: np.ndarray, frame_rate: int, edge_fade_ms: int) -> np.ndarray:
@@ -304,31 +381,39 @@ def stitch_sequence(
     edge_fade_ms: int = DEFAULT_EDGE_FADE_MS,
     peak_dbfs: float = DEFAULT_PEAK_DBFS,
     head_trim_threshold_dbfs: float = HEAD_TRIM_THRESHOLD_DBFS,
-) -> Tuple[str, float, float, List[float], List[float], List[float]]:
+    max_durations: Optional[Sequence[Optional[float]]] = None,
+) -> Tuple[str, float, float, List[float], List[float], List[float], List[Optional[float]]]:
     """按顺序拼接任意多段音频，每段可指定到下一段的交叉淡化时长。
 
     Args:
         sources: [(音频路径或 URL, 与下一段的 crossfade_ms), ...]
         output_path: 输出路径；默认 static/output/stitch_xxx.wav
         head_trim_threshold_dbfs: 首尾静音裁切的帧能量阈值，默认 -50 dBFS（首段不裁头部片头）
+        max_durations: 与 sources 等长的每段保留秒数上限，None 表示不裁；
+            切点会吸附到结构边界候选，见 `_truncate_to_length`
 
     Returns:
         (输出路径, 成品时长秒, 成品峰值 dBFS, 每段在成品中的起点秒数,
-         每段被剔除的头部秒数, 每段被剔除的尾部秒数)
+         每段被剔除的头部秒数, 每段被剔除的尾部秒数, 每段被截断后的秒数（未截断为 None）)
     """
     if not sources:
         raise AudioSourceError("至少需要一段音频")
     if len(sources) == 1:
         raise AudioSourceError("至少需要两段音频才能拼接")
+    if max_durations is not None and len(max_durations) != len(sources):
+        raise AudioSourceError("max_durations 必须与 segments 等长")
 
     temps: List[Path] = []
     frame_rate = SAMPLE_RATE
+    limits: List[Optional[float]] = list(max_durations) if max_durations else [None] * len(sources)
     try:
         mixed: Optional[np.ndarray] = None
         pending_crossfade = 0
         segment_starts: List[float] = []
         head_trim: List[float] = []
         tail_trim: List[float] = []
+        truncate_to: List[Optional[float]] = []
+        truncate_snapped: List[bool] = []
         for index, (source, crossfade_to_next) in enumerate(sources):
             current, rate, temp = _load_audio(source)
             if temp is not None:
@@ -337,7 +422,10 @@ def stitch_sequence(
                 # 首段保留原始片头留白，但尾部静音一样要剔除，否则接缝前留着整段死寂
                 current, trimmed_tail = _trim_tail_silence(current, head_trim_threshold_dbfs)
                 frame_rate = rate
+                current, kept_sec, snapped = _truncate_to_length(current, frame_rate, limits[index])
                 tail_trim.append(trimmed_tail / float(frame_rate))
+                truncate_to.append(kept_sec)
+                truncate_snapped.append(snapped)
                 mixed = current
                 pending_crossfade = crossfade_to_next
                 segment_starts.append(0.0)
@@ -362,6 +450,9 @@ def stitch_sequence(
             head_trim.append(trimmed / float(frame_rate))
             current, trimmed_tail = _trim_tail_silence(current, head_trim_threshold_dbfs)
             tail_trim.append(trimmed_tail / float(frame_rate))
+            current, kept_sec, snapped = _truncate_to_length(current, frame_rate, limits[index])
+            truncate_to.append(kept_sec)
+            truncate_snapped.append(snapped)
             if current.shape[0] == 0:
                 raise AudioSourceError("输入音频裁剪后为空")
             logger.info(
@@ -409,15 +500,27 @@ def stitch_sequence(
         peak = float(np.max(np.abs(mixed))) if mixed.size else 0.0
         peak_dbfs_actual = 20.0 * np.log10(peak) if peak > 0 else -120.0
         logger.info(
-            "stitch done: frames=%d rate=%d duration=%.3fs segment_start_ms=%s head_trim_ms=%s tail_trim_ms=%s",
+            "stitch done: frames=%d rate=%d duration=%.3fs segment_start_ms=%s head_trim_ms=%s "
+            "tail_trim_ms=%s truncate_to_sec=%s truncate_snapped=%s",
             mixed.shape[0],
             frame_rate,
             duration,
             [round(start * 1000.0, 3) for start in segment_starts],
             [round(sec * 1000.0, 3) for sec in head_trim],
             [round(sec * 1000.0, 3) for sec in tail_trim],
+            truncate_to,
+            truncate_snapped,
         )
-        return str(path), duration, float(peak_dbfs_actual), segment_starts, head_trim, tail_trim
+        return (
+            str(path),
+            duration,
+            float(peak_dbfs_actual),
+            segment_starts,
+            head_trim,
+            tail_trim,
+            truncate_to,
+            truncate_snapped,
+        )
     finally:
         for temp in temps:
             temp.unlink(missing_ok=True)

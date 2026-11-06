@@ -15,4 +15,6 @@ out/
 # runtime artifacts
 backend/static/output/*.wav
 backend/static/generated/*.wav
+# clip_id → 落盘文件名索引，由 api/generate.py 在片段落盘时写，本机运行时状态
+backend/data/clip_index.json
 .DS_Store

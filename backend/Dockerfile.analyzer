@@ -1,0 +1,104 @@
+# 深度学习结构分析服务（All-In-One / allin1）。
+# 与主后端共用 ./backend 代码，但依赖栈独立成镜像：主容器不装 torch，开发回路不受影响。
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_RETRIES=8 \
+    PIP_DEFAULT_TIMEOUT=90 \
+    HOME=/data/cache \
+    HF_HOME=/data/cache/huggingface \
+    TORCH_HOME=/data/cache/torch
+
+WORKDIR /app
+
+# madmom / natten 在 PyPI 只有 sdist，必须现场编译。
+# Acquire::Retries：本机的 apt 走本地代理，实测会在下载中途抛「500 unexpected EOF」，
+# 不重试就得整层重跑（一次 88 MB）
+RUN apt-get update -o Acquire::Retries=5 && \
+    apt-get install -y --no-install-recommends -o Acquire::Retries=5 \
+        build-essential \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# 层 1：torch / torchaudio 钉 2.1.2（natten 0.14.6 与 allin1 训练期同代 torch；
+# 拿 2.10 的头文件去编 0.14 的 C++ 扩展有 ABI 漂移风险）。
+# 索引用 --extra-index-url 而不是 --index-url：官方 CPU 索引的 2.1.2 只有 linux_x86_64 / win_amd64
+# 轮子，aarch64 一律没有（实测 /whl/cpu/torch 的 aarch64 轮子数 = 0）。所以
+#   x86_64 取 CPU 索引里版本更高的 2.1.2+cpu，绕开 PyPI 那份要拖 nvidia-cudnn / nccl / triton 数 GB 的 CUDA 版；
+#   aarch64 只能落回 PyPI —— 它的 manylinux2014_aarch64 轮子本来就是 CPU 构建，
+#     而且那些 nvidia-* / triton 依赖全带 platform_machine == "x86_64" 标记，在本平台不会被装。
+# torchaudio 是 demucs 4.0.1 的直接依赖，不在这层钉住的话 pip 会顺手把 torch 顶到最新版。
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
+        "torch==2.1.2" "torchaudio==2.1.2"
+
+# 层 2：numpy / scipy / Cython 必须先就位，madmom 与 natten 的扩展编译才找得到头文件。
+# 三个都钉版本：scipy 1.14+ 的轮子按 numpy 2.x ABI 构建，跟本层的 numpy 1.26.4 装在一起会在 import 时炸。
+RUN pip install --no-cache-dir \
+        "numpy==1.26.4" "Cython==3.0.11" "scipy==1.13.1"
+
+# 层 3：natten —— allin1/models/dinat.py 无条件 `from natten.functional import natten1dqkrpb...`。
+# 0.15 之后这套旧 API 被删掉，只有 0.14.x 还在；setup.py 在无 CUDA 时自动编 CPU 内核（本机实测 322 s）。
+RUN pip install --no-cache-dir --no-build-isolation "natten==0.14.6"
+
+# 层 4：madmom —— allin1 的 spectrogram 与 downbeat 后处理都依赖它。
+# 取 main 分支的固定 commit（仓库默认分支不是 master；PyPI 的 0.16.1 对 numpy>=1.24 已坏；
+# 它要求 numpy>=1.13.4 + scipy>=1.13，与本镜像的 1.26.4 / 1.13.1 正好对上游）。
+# 用 archive tarball 而不是 git+https：git+ 会跑 `git submodule update --init`，
+# madmom 的 models 子模块（CPJKU/madmom_models）在本机代理下 TLS 握手直接被掐
+# （实测 `GnuTLS, handshake failed: The TLS connection was non-properly terminated` 两次重试都失败）。
+# 少这个子模块不影响推理：madmom 里 `from ..models import ...` 全在方法体内按需执行，
+# allin1 用到的 DBNDownBeatTrackingProcessor 是纯 Viterbi 后处理，不加载任何 NN 权重文件；
+# setup.py 那些 models/** package_data glob 匹配不到东西也不会失败。
+# 但顶层 `from . import ... models ...` 会因为这个目录没进 site-packages 直接 ImportError，
+# 所以下一层要用 vendor/ 里的替身补上。
+RUN pip install --no-cache-dir --no-build-isolation \
+        "https://github.com/CPJKU/madmom/archive/27f032e8947204902c675e5e341a3faf5dc86dae.tar.gz"
+
+# 层 5：其余依赖
+COPY requirements.txt requirements-ml.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-ml.txt
+
+# 层 6：libsndfile 系统库。soundfile 的 manylinux 轮子只为 x86_64 打包了自带的
+# libsndfile.so，aarch64 轮子更没有；本层实际选到的是 py2.py3-none-any 的纯 Python 轮子
+# （24 kB，不含任何原生库）→ import 时退回 ctypes.util.find_library('sndfile')，
+# 在 slim 镜像里直接 OSError: cannot load library 'libsndfile.so'，
+# 连带 demucs 的落盘和 allin1 读波形一起挂掉。
+RUN apt-get update -o Acquire::Retries=5 \
+    && apt-get install -y --no-install-recommends -o Acquire::Retries=5 libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 层 7：补 madmom.models —— madmom@main 把它做成 gitlink 子模块，tarball 里是空目录、
+# pip 装完 site-packages/madmom/models 干脆不存在，而 madmom/__init__.py 顶层就 import 它。
+# 替身只定义 path，理由见 vendor/madmom/models/__init__.py。
+# 放在依赖装完之后：改这一行不会让 natten(322s)/madmom 的编译层失效。
+COPY vendor/madmom/models/__init__.py /usr/local/lib/python3.11/site-packages/madmom/models/
+
+# 层 8：依赖自检 —— 装歪了就让构建失败，而不是等运行时降级成「一段假数据」才察觉。
+# pip check 查版本冲突；import 查能不能真的加载（madmom / natten 这类现场编译的扩展只在
+# import 时暴露问题）；最后按 allin1 推理链实际会走的 import 逐个构造一遍，
+# 只 `import allin1` 是不够的 —— 它的 spectrogram / metrical 才是用到 madmom 的那两处。
+RUN pip check \
+    && python -c "import numpy, scipy, torch, torchaudio, natten, librosa, soundfile, matplotlib; \
+import madmom, demucs, allin1; \
+from importlib.metadata import version; \
+from natten.functional import natten1dqkrpb, natten1dav, natten2dqkrpb, natten2dav; \
+from madmom.audio.signal import FramedSignalProcessor, Signal; \
+from madmom.audio.stft import ShortTimeFourierTransformProcessor; \
+from madmom.audio.spectrogram import FilteredSpectrogramProcessor, LogarithmicSpectrogramProcessor; \
+from madmom.features.downbeats import DBNDownBeatTrackingProcessor; \
+DBNDownBeatTrackingProcessor(beats_per_bar=[2, 4], fps=100, printable=False); \
+import allin1.spectrogram, allin1.postprocessing.metrical; \
+print('deps-ok torch=%s numpy=%s scipy=%s madmom=%s allin1=%s' % (torch.__version__, numpy.__version__, scipy.__version__, madmom.__version__, version('allin1')))"
+
+COPY . .
+
+EXPOSE 8100
+
+# 权重预下载（只取用到的 fold + htdemucs bag）+ 依赖自检；失败不阻塞起服务，接口走降级。
+# 服务进程带 HF_HUB_OFFLINE=1：权重已经在 analyzer_cache 卷里，但 allin1 仍会向
+# huggingface.co 发一次 metadata HEAD —— 本机代理随机掐 TLS，那次 HEAD 会以 SSLEOFError
+# 打死整条推理（实测 bench 第一轮就死在这里，而 .pth 就在本地）。预下载步骤本身保持联网，
+# 否则冷卷永远拿不到权重。
+CMD ["sh", "-c", "python -m utils.structure_weights || echo '权重预下载失败，接口将走降级'; HF_HUB_OFFLINE=1 uvicorn analyzer_server:app --host 0.0.0.0 --port 8100"]

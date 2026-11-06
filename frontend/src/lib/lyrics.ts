@@ -179,14 +179,23 @@ function countLyricLines(lyrics: string): number {
   return lyrics.split("\n").filter((line) => line.trim()).length;
 }
 
-function estimateDuration(block: LyricBlock): number {
-  const lines = countLyricLines(block.lyrics);
-  if (lines === 0) return block.kind === "intro" || block.kind === "outro" ? 8 : 12;
+function estimateDuration(kind: SectionKind, lyrics: string): number {
+  const lines = countLyricLines(lyrics);
+  if (lines === 0) return kind === "intro" || kind === "outro" ? 8 : 12;
 
   const seconds = lines * 4 + 4; // 每句约 4s，另留换气与器乐余量
   const max =
-    block.kind === "verse" || block.kind === "chorus" ? 60 : block.kind === "intro" || block.kind === "outro" ? 30 : 40;
+    kind === "verse" || kind === "chorus" ? 60 : kind === "intro" || kind === "outro" ? 30 : 40;
   return Math.round(Math.min(max, Math.max(8, seconds)));
+}
+
+/** 无词段落在拼接侧最多保留几秒；有歌词就返回 undefined，不裁。
+ *  这类段落发给上游的是 `make_instrumental=true` + 空歌词，Suno 没有时长字段可吃，
+ *  一律写满一整首（实测 177~193s），只能靠这个规划秒数在拼接时兑现。
+ *  刻意不读 `section.durationSec`：生成后它会被 applyNaturalDuration 覆写成返回音频的实际长度，
+ *  拿 182.6s 去裁 182.6s 的素材等于什么都没做。 */
+export function plannedTruncateSec(section: TimelineSection): number | undefined {
+  return section.lyrics.trim() ? undefined : estimateDuration(section.kind, section.lyrics);
 }
 
 function firstLyricLine(lyrics: string): string {
@@ -260,7 +269,7 @@ function buildSections(blocks: LyricBlock[], songPrompt: string): TimelineSectio
       kind: block.kind,
       title: suffix ? `${meta.title} ${suffix}` : meta.title,
       english: suffix ? `${meta.english} ${suffix}` : meta.english,
-      durationSec: estimateDuration(block),
+      durationSec: estimateDuration(block.kind, block.lyrics),
       prompt: composeSectionPrompt(songPrompt, block.kind, block.lyrics),
       lyrics: block.lyrics,
       ...SECTION_STYLES[block.kind],

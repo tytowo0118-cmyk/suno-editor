@@ -35,6 +35,7 @@ import httpx
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import FileResponse
 
+from utils import clip_index
 from utils.audio_processor import STATIC_DIR
 
 logger = logging.getLogger(__name__)
@@ -384,9 +385,9 @@ async def _submit(
         payload["tags"],
         payload["prompt"][:32],
     )
-    model = os.environ.get("SUNO_MODEL", "").strip()
-    if model:
-        payload["model"] = model
+    mv = os.environ.get("SUNO_MODEL", "").strip()
+    if mv:
+        payload["mv"] = mv
     if continue_clip_id:
         # 续写：上游以 clip 在 continue_at 之前的音频为上下文，生成其后的新内容
         payload["continue_clip_id"] = continue_clip_id
@@ -752,11 +753,15 @@ async def generate_music(
         materialized: list[tuple[Path, float]] = []
         for index, record in enumerate(records):
             try:
-                materialized.append(await _materialize(client, record, stem, index))
+                path, _duration = await _materialize(client, record, stem, index)
             except HTTPException:
-                for path, _duration in materialized:
-                    path.unlink(missing_ok=True)
+                for landed, _ in materialized:
+                    landed.unlink(missing_ok=True)
                 raise
+            materialized.append((path, _duration))
+            # 落盘名里那 6 位是本地的 uuid4，不是 Suno 的 clip_id；不记这一笔，
+            # GET /api/analyze_structure?clip_id= 就只能靠文件名找人
+            clip_index.record(record.get("clip_id"), path.name, task_id)
 
         base_url = str(request.base_url).rstrip("/")
         extras = [

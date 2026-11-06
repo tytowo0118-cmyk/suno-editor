@@ -1,0 +1,102 @@
+[
+  {
+    "filename": "dlp-A_1793845120_suno_179.wav",
+    "duration": 491.883,
+    "source_clips": [
+      "suno_1793678392_03ddbf.wav",
+      "suno_1793678405_ea3715.wav",
+      "suno_1793678438_b37b93.wav"
+    ],
+    "crossfade_ms": 8,
+    "seams": [
+      176.559,
+      349.166
+    ],
+    "head_trim_sec": [
+      0.0,
+      0.023,
+      0.246
+    ],
+    "tail_trim_sec": [
+      1.441,
+      0.018,
+      0.005
+    ]
+  },
+  {
+    "filename": "dlp-B_1793845121_suno_179.wav",
+    "duration": 127.887,
+    "source_clips": [
+      "suno_1793677292_700f18.wav",
+      "suno_1793677292_700f18_1.wav",
+      "suno_1793678609_3932bd.wav"
+    ],
+    "crossfade_ms": 8,
+    "seams": [
+      31.375,
+      92.567
+    ],
+    "head_trim_sec": [
+      0.0,
+      0.121,
+      0.169
+    ],
+    "tail_trim_sec": [
+      0.705,
+      0.623,
+      0.679
+    ]
+  },
+  {
+    "filename": "dlp-C_1793845122_suno_179.wav",
+    "duration": 157.843,
+    "source_clips": [
+      "suno_1793758427_7d0507.wav",
+      "suno_1793678664_a4f0be.wav",
+      "suno_1793584223_f06929.wav",
+      "suno_1793589182_4ac98b.wav"
+    ],
+    "crossfade_ms": 8,
+    "seams": [
+      44.035,
+      84.787,
+      119.035
+    ],
+    "head_trim_sec": [
+      0.0,
+      0.229,
+      0.008,
+      0.283
+    ],
+    "tail_trim_sec": [
+      0.021,
+      0.243,
+      0.969,
+      0.293
+    ]
+  },
+  {
+    "filename": "dlp-D_1793845122_suno_179.wav",
+    "duration": 587.165,
+    "source_clips": [
+      "suno_1793671935_ec163b.wav",
+      "suno_1793671937_aeb167.wav",
+      "suno_1793671917_bfd475.wav"
+    ],
+    "crossfade_ms": 8,
+    "seams": [
+      201.417,
+      404.406
+    ],
+    "head_trim_sec": [
+      0.0,
+      0.023,
+      0.024
+    ],
+    "tail_trim_sec": [
+      0.44,
+      0.164,
+      0.961
+    ]
+  }
+]

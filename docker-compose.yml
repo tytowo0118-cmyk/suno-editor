@@ -26,6 +26,19 @@ services:
       LLM_API_BASE: ${LLM_API_BASE:-}
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      # 深度学习结构分析：off | env STRUCTURE_ANALYZER_URL 自动决定，主容器不含 torch
+      STRUCTURE_ANALYZER_URL: ${STRUCTURE_ANALYZER_URL:-http://analyzer:8100}
+      # 超时 = max(下限, 倍率 × 音频时长)。实测整曲流水线 1.05× 实时（127.9 s 音频跑 134.6 s；
+      # 491.9/157.8/587.2 s 三条冷跑是 1.09×/1.10×/1.02×），给 3 倍余量付模型加载与抢核；
+      # 一口价会让五分钟的歌必然降级，而长成品正是最需要分段的那类素材。
+      STRUCTURE_ANALYZER_TIMEOUT: ${STRUCTURE_ANALYZER_TIMEOUT:-180}
+      STRUCTURE_ANALYZER_SEC_PER_SEC: ${STRUCTURE_ANALYZER_SEC_PER_SEC:-3}
+      # 同一个变量也要给主后端看：它的 HTTP 下限必须盖过分析容器的排队预算，否则对端还在
+      # 合法排队（前面那条歌的分轨）时这边先 ReadTimeout 掐断，分轨白烧。
+      # 实测踩过：127.887 s 排在 587.165 s 后面，383.7 s 超时降级。
+      AIO_QUEUE_TIMEOUT: ${AIO_QUEUE_TIMEOUT:-900}
+      # 与 analyzer 服务同一个变量：主容器只报模型名，不加载它，两边必须一致
+      AIO_MODEL: ${AIO_MODEL:-harmonix-fold0}
     command: >
       uvicorn main:app
       --host 0.0.0.0
@@ -43,6 +56,54 @@ services:
       timeout: 5s
       retries: 12
       start_period: 20s
+
+  # 深度学习音乐结构分析（All-In-One / allin1）。
+  # 与主后端共用 ./backend 代码但镜像独立：torch + madmom 编译 + 80 MB 权重都留在这里，
+  # 主容器保持 slim，改依赖不会把 --reload 的开发回路拖成十分钟构建。
+  analyzer:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.analyzer
+    container_name: museblocks-analyzer
+    init: true
+    # 刻意不发布宿主机端口：它能吃满 8 核，只允许 compose 网络内的后端访问
+    volumes:
+      # 只读挂载：分析服务只需要读 WAV，不该写应用代码目录（也避免触发主容器 reload）
+      - ./backend:/app:ro
+      - analyzer_cache:/data/cache
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      ANALYZER_AUDIO_ROOT: /app/static
+      # 结果缓存 / demucs 4 轨 / 谱特征都写这里：放在命名卷 analyzer_cache 里，
+      # 容器重建后同一首曲子仍然命中 allin1 的 JSON 缓存，不用重跑分轨
+      STRUCTURE_WORK_DIR: ${STRUCTURE_WORK_DIR:-/data/cache/work}
+      AIO_MODEL: ${AIO_MODEL:-harmonix-fold0}
+      AIO_THREADS: ${AIO_THREADS:-4}
+      AIO_WORKERS: ${AIO_WORKERS:-1}
+      # 分轨是子进程（python -m demucs.separate），父进程的 torch.set_num_threads 对它无效，
+      # 线程数只能靠这个环境变量传进去。实测 127.887 s 音频：OMP=4 → 126.6 s（0.99× 实时），
+      # OMP=8 反而 138.0 s、OMP=2 更慢（140.7 s）—— 8 核机器上 4 是分轨的甜点。
+      OMP_NUM_THREADS: ${AIO_THREADS:-4}
+      # numpy/OpenBLAS 与 torch 的 OpenMP 各自开池会互相踩（日志里的
+      # "OpenBLAS Warning : Detect OpenMP Loop and this application may hang"），
+      # 钉成 1 把核让给 torch，也让子进程行为可预测。
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      # 排队预算必须大于一次推理的墙钟：三个候选连点时，后两条不该被 429 掉
+      AIO_QUEUE_TIMEOUT: ${AIO_QUEUE_TIMEOUT:-900}
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=5)",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
 
   frontend:
     build:
@@ -81,3 +142,5 @@ services:
 volumes:
   frontend_node_modules:
   frontend_next:
+  # HuggingFace 权重 + htdemucs bag + 分析产物（demix 4 轨、spec、结果 JSON）
+  analyzer_cache:

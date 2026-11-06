@@ -30,6 +30,9 @@ class StitchSegment(BaseModel):
     audio_url: str = Field(max_length=2048)
     # 该段与下一段之间的交叉淡化时长；最后一段的该值会被忽略
     crossfade_ms: int = Field(default=200, ge=0, le=5000)
+    # 该段在成品里最多保留的秒数。Suno 不吃时长参数，纯器乐段会写满一整首，
+    # 由前端把段落的规划时长传进来，后端在静音裁切之后按这段上限裁掉多余尾部
+    max_duration_sec: Optional[float] = Field(default=None, gt=0, le=600)
 
 
 class StitchRequest(BaseModel):
@@ -52,9 +55,13 @@ class StitchResponse(BaseModel):
     # 每段拼接时物理剔除的尾部静音（秒）；Suno 成品自带 0.06~1.96s 尾部数字静音，
     # 不剔除就会留在接缝前面形成听感真空
     tail_trim_sec: List[float]
+    # 每段按 max_duration_sec 裁切后实际保留的秒数；未超限或不传时为 null
+    truncate_to_sec: List[Optional[float]]
+    # 该段切点是否吸附到了 ±0.5s 内的结构边界候选；false 表示直接停在目标秒数上
+    truncate_snapped: List[bool]
 
 
-def _normalize_source(url: str) -> str:
+def normalize_source(url: str) -> str:
     """同一后端的绝对 /static 地址直接映射为本地路径，避免服务端请求自身。"""
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme in ("http", "https") and parsed.path.startswith("/static/"):
@@ -69,11 +76,22 @@ def stitch_timeline(payload: StitchRequest, request: Request) -> StitchResponse:
         raise HTTPException(status_code=422, detail="output_name 仅允许字母、数字、下划线和中划线")
 
     filename = f"{name}_{int(time.time())}_{Path(payload.segments[0].id).name[:8]}.wav"
-    sources = [(_normalize_source(seg.audio_url), seg.crossfade_ms) for seg in payload.segments]
+    sources = [(normalize_source(seg.audio_url), seg.crossfade_ms) for seg in payload.segments]
 
     try:
-        output_path, duration, peak_dbfs, segment_starts, head_trim, tail_trim = stitch_sequence(
-            sources, output_path=filename
+        (
+            output_path,
+            duration,
+            peak_dbfs,
+            segment_starts,
+            head_trim,
+            tail_trim,
+            truncate_to,
+            truncate_snapped,
+        ) = stitch_sequence(
+            sources,
+            output_path=filename,
+            max_durations=[seg.max_duration_sec for seg in payload.segments],
         )
     except AudioSourceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -97,4 +115,6 @@ def stitch_timeline(payload: StitchRequest, request: Request) -> StitchResponse:
         segment_start_sec=[round(start, 3) for start in segment_starts],
         head_trim_sec=[round(sec, 3) for sec in head_trim],
         tail_trim_sec=[round(sec, 3) for sec in tail_trim],
+        truncate_to_sec=[None if sec is None else round(sec, 3) for sec in truncate_to],
+        truncate_snapped=truncate_snapped,
     )
