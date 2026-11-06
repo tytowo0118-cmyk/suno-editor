@@ -278,6 +278,53 @@ export function mixPlayheadPosition(
   };
 }
 
+/** 成品时间轴上，某一段真实占用的长度。 */
+export interface MixSegmentSpan {
+  sectionId: string;
+  /** 该段在成品时间轴上的起点（后端 `segment_start_sec` 原样） */
+  startSec: number;
+  /** 该段在成品里真正占用的秒数（含与下一段共享的那 8ms） */
+  lengthSec: number;
+  /** 占成品总长的百分比，直接当色带宽度用 */
+  percent: number;
+}
+
+/**
+ * 成品里每段**真实占用**的长度 —— 完全从后端回传的段起点反推，不猜、不重算 DSP。
+ *
+ * 拼接是 8ms 微淡入淡出，相邻两段共享这 8ms，所以第 i 段（i < n-1）占到
+ * `start[i+1] - start[i] + crossfade`，最后一段占到成品结尾。
+ * 自检恒等式 `Σ lengthSec - crossfade × (n-1) === durationSec`：实测三段
+ * （起点 0 / 7.992018 / 185.144036，成品 193.144s）算出 8.000 / 177.160 / 8.000 s，
+ * 相加 193.160 再减两条接缝的 16ms 正好回到 193.144。
+ *
+ * 这条函数存在的理由：规划色块按 `durationSec`（Suno 返回音频的自然长度）分配宽度，
+ * 而无词段落进成品会被裁到规划上限，于是一条 182.6s 的前奏只占 8s —— 色带宽度
+ * 和成品对不上。把真实占用摊成第二条色带，两处口径就能同屏对照。
+ */
+export function mixSegmentSpans(playhead: MixPlayhead): MixSegmentSpan[] {
+  const { segmentOrder, segmentStartSec, durationSec } = playhead;
+  if (!(durationSec > 0) || segmentOrder.length === 0) return [];
+
+  const overlapSec = CROSSFADE_MS / 1000;
+  return segmentOrder.map((sectionId, index) => {
+    const startSec = segmentStartSec[index] ?? 0;
+    const nextStart =
+      index + 1 < segmentOrder.length ? (segmentStartSec[index + 1] ?? durationSec) : durationSec;
+    // 最后一段占到结尾，其余段把与下一段重叠的那 8ms 也算进自己的占用
+    const lengthSec = Math.max(
+      0,
+      nextStart - startSec + (index + 1 < segmentOrder.length ? overlapSec : 0),
+    );
+    return {
+      sectionId,
+      startSec,
+      lengthSec,
+      percent: (lengthSec / durationSec) * 100,
+    };
+  });
+}
+
 /** 模型边界与检测候选重合到这个精度以内就只留检测候选那条（它定位更准）。 */
 const MERGE_DEDUPE_SEC = 0.05;
 

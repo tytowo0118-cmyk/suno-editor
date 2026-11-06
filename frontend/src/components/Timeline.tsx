@@ -17,7 +17,13 @@ import {
   useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { buildTimings, formatClock, mixPlayheadPosition, type MixPlayhead } from "@/lib/sections";
+import {
+  buildTimings,
+  formatClock,
+  mixPlayheadPosition,
+  mixSegmentSpans,
+  type MixPlayhead,
+} from "@/lib/sections";
 import type { SectionTiming, Take, TimelineSection } from "@/lib/types";
 
 interface TimelineProps {
@@ -140,6 +146,17 @@ export default function Timeline({
   const timings = buildTimings(sections);
   const totalDuration = sections.reduce((sum, section) => sum + section.durationSec, 0);
   const playheadPosition = playhead ? mixPlayheadPosition(sections, playhead) : null;
+  // 第二条色带：成品里每段真实占用多长，完全由后端回传的段起点反推（见 mixSegmentSpans）
+  const mixSpans = playhead ? mixSegmentSpans(playhead) : [];
+  const mixPercent =
+    playhead && playhead.durationSec > 0
+      ? Math.min(100, Math.max(0, (playhead.timeSec / playhead.durationSec) * 100))
+      : null;
+  const mixRatioOfPlan =
+    playhead && totalDuration > 0 ? (playhead.durationSec / totalDuration) * 100 : null;
+  const missingFromMix = sections.length - mixSpans.length;
+  const sectionOf = (sectionId: string) =>
+    sections.find((section) => section.id === sectionId);
 
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event;
@@ -200,7 +217,11 @@ export default function Timeline({
         </DndContext>
       </div>
 
-      <div className="relative mt-3">
+      <div className="mt-4 font-mono text-[9px] tracking-wider text-zinc-600">
+        规划时长 / PLANNED（按 Suno 返回音频的自然长度分配宽度）
+      </div>
+
+      <div className="relative mt-1">
         <div className="flex h-1 overflow-hidden rounded-full bg-white/5">
           {sections.map((section) => (
             <span
@@ -219,8 +240,49 @@ export default function Timeline({
         )}
       </div>
 
+      {mixSpans.length > 0 && (
+        <div className="mt-3">
+          <div className="mb-1 flex flex-wrap items-center justify-between gap-2 font-mono text-[9px] tracking-wider text-zinc-600">
+            <span>成品实际占用 / ACTUAL IN MIX</span>
+            <span>
+              {playhead ? `${playhead.durationSec.toFixed(2)}s` : ""}
+              {mixRatioOfPlan != null ? ` · 规划 ${totalDuration}s 的 ${mixRatioOfPlan.toFixed(0)}%` : ""}
+              {missingFromMix > 0 ? ` · ${missingFromMix} 段未锁定不进成品` : ""}
+            </span>
+          </div>
+          <div className="relative">
+            <div className="flex h-1.5 overflow-hidden rounded-full bg-white/5">
+              {mixSpans.map((span, index) => {
+                const section = sectionOf(span.sectionId);
+                return (
+                  <span
+                    key={`${span.sectionId}-${index}`}
+                    title={
+                      `${section?.title ?? span.sectionId} · 成品占 ${span.lengthSec.toFixed(2)}s` +
+                      (section ? ` / 规划 ${section.durationSec}s` : "")
+                    }
+                    className={`h-full ${section?.barClass ?? "bg-white/20"}`}
+                    style={{ flexGrow: span.lengthSec, flexBasis: 0 }}
+                  />
+                );
+              })}
+            </div>
+            {mixPercent != null && (
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute -top-1 bottom-[-3px] w-0.5 -translate-x-1/2 rounded-full bg-emerald-300 shadow-[0_0_10px_rgba(110,231,183,0.75)] transition-[left] duration-75 ease-linear"
+                style={{ left: `${mixPercent}%` }}
+              />
+            )}
+          </div>
+        </div>
+      )}
+
       <p className="mt-3 text-[11px] leading-relaxed text-zinc-500">
         点击色块切换下方生成框 · 拖动右上角手柄调整结构 · 时长按 Suno 返回音频自适应展开
+        {mixSpans.length > 0
+          ? " · 下方色带是成品里各段真实占用，无词段落被裁到规划上限所以会明显短于上方规划色带"
+          : ""}
       </p>
     </section>
   );
