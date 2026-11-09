@@ -20,6 +20,7 @@ from api.generate_jobs import router as generate_jobs_router
 from api.lyrics import router as lyrics_router
 from api.stitch import router as stitch_router
 from api.structure import router as structure_router
+from api.trim import router as trim_router
 from utils import generate_cache
 
 logging.basicConfig(
@@ -57,6 +58,7 @@ app.include_router(generate_jobs_router)
 app.include_router(lyrics_router)
 app.include_router(stitch_router)
 app.include_router(structure_router)
+app.include_router(trim_router)
 
 
 @app.get("/")

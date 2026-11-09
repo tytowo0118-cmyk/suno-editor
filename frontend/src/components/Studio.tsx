@@ -19,6 +19,7 @@ import {
   describeGenerateJob,
   generateTakes,
   revokeTakeAudio,
+  trimTakesToPlan,
 } from "@/lib/musicgen";
 import {
   CROSSFADE_MS,
@@ -419,13 +420,35 @@ export default function Studio() {
         revokeTakeAudio(generated);
         return;
       }
+
+      // 器乐段（无歌词）上游写满整首：生成后立刻按规划秒数裁成「只有本段」。
+      // 裁剪走的是后端本地 DSP，不再花钱；失败就保留原片，拼接时仍会按 max_duration_sec 裁。
+      const plannedSec = plannedTruncateSec(section);
+      let candidates = generated;
+      let trimFailed = 0;
+      if (plannedSec && generated.length > 0) {
+        const trimmed = await trimTakesToPlan(generated, plannedSec);
+        candidates = trimmed.takes;
+        trimFailed = trimmed.failed;
+      }
+      // 裁剪要读文件、写片段，期间可能已切换设定或重新点击；旧结果不能写回
+      if (epochRef.current !== epoch || requestSeq.current[sectionId] !== seq) {
+        revokeTakeAudio(candidates);
+        return;
+      }
+
       setTakes((prev) => {
         revokeTakeAudio(prev[sectionId]);
-        return { ...prev, [sectionId]: generated };
+        return { ...prev, [sectionId]: candidates };
       });
       // 已锁定的段落以锁定音频为准，避免重新生成时改变成品布局
-      if (!lockedRef.current[sectionId] && generated[0]) {
-        applyNaturalDuration(sectionId, generated[0].duration);
+      if (!lockedRef.current[sectionId] && candidates[0]) {
+        applyNaturalDuration(sectionId, candidates[0].duration);
+      }
+      if (trimFailed > 0 && plannedSec) {
+        notify(
+          `${trimFailed} 条候选未能裁到规划 ${plannedSec}s，暂时保留整首；锁定后拼接时仍会裁`,
+        );
       }
       // 命中账本是「这次没花钱」的好消息，值得一条提示；正常建单不用刷屏，
       // 计费语义在进度条里常驻显示（info 提示 3.2s 就没了，进度条不会）

@@ -310,6 +310,56 @@ def _write_wav(path: Path, samples: np.ndarray, frame_rate: int) -> None:
         handle.writeframes(pcm.tobytes())
 
 
+def trim_clip_to_seconds(
+    source: str,
+    max_sec: float,
+    *,
+    output_dir: Optional[Path] = None,
+) -> Tuple[Path, float, float, bool]:
+    """把单段音频裁到 `max_sec` 以内并落盘，用于器乐候选生成后的「只留本段」。
+
+    上游 `make_instrumental` 不吃任何时长参数，空歌词的前奏会写满一整首
+    （实测 205.560 / 189.504 s）；不裁的话候选卡与时间轴都按整首展开，
+    用户看到的「前奏」其实是整首歌，直到拼接时才被 `max_duration_sec` 砍到 8 s。
+
+    与拼接侧同一套裁切口径：先剔尾部数字静音，再在目标秒数 ±`CUT_SNAP_SEC`
+    内吸附结构候选；窗内没有候选就硬停在目标秒数。2026-11-09 对两条前奏素材实测：
+    前 90 s 内检测器只给出 83.4 s 一个候选，8 s 目标窗内没有，裁出就是 8.000 s。
+
+    Returns:
+        (输出路径, 原始时长, 保留时长, 切点是否吸附)；
+        原片本来就没超限时不写新文件，返回原路径与原始时长。
+    """
+    samples, frame_rate = read_audio(source)
+    source_sec = samples.shape[0] / float(frame_rate)
+    trimmed, _ = _trim_tail_silence(samples, HEAD_TRIM_THRESHOLD_DBFS)
+    kept, kept_sec, snapped = _truncate_to_length(trimmed, frame_rate, max_sec)
+    if kept_sec is None:
+        return _resolve_local_path(source), round(source_sec, 3), round(source_sec, 3), False
+
+    target_dir = output_dir or OUTPUT_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{Path(source).stem}_trim{int(round(max_sec * 1000))}ms.wav"
+    output_path = target_dir / filename
+    # 先写临时文件再原子替换：同一源被并发裁两次时不会读到写了一半的 WAV
+    temp_path = target_dir / f".{filename}.{os.urandom(4).hex()}.tmp"
+    try:
+        _write_wav(temp_path, kept, frame_rate)
+        os.replace(temp_path, output_path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    logger.info(
+        "clip_trimmed: source=%.3fs kept=%.3fs target=%.3fs snapped=%s file=%s",
+        source_sec,
+        kept_sec,
+        max_sec,
+        snapped,
+        output_path.name,
+    )
+    return output_path, round(source_sec, 3), kept_sec, snapped
+
+
 def _output_path(output_path: Optional[str]) -> Path:
     if output_path:
         path = Path(output_path).expanduser()

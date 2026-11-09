@@ -1,4 +1,4 @@
-import { API_BASE, runGenerateJob } from "./api";
+import { API_BASE, runGenerateJob, trimAudio } from "./api";
 import type { GenerateJob, GenerateSource, Take } from "./types";
 
 /** FastAPI 后端的生成任务端点：提交拿 job_id，轮询读阶段进度（旧的同步 /api/generate 仍保留） */
@@ -7,8 +7,15 @@ export const GENERATE_ENDPOINT = `${API_BASE}/api/generate/jobs`;
 /** 后端 `MAX_CLIPS_PER_TASK = 2`：一次任务上游固定产 2 条双生，同价，不取回才是白扔 */
 export const CLIPS_PER_TASK = 2;
 
-/** 每段发几次任务。2 次 × 双生 = 4 个候选，比原来 3 次任务省一次扣费 */
-export const TASKS_PER_SECTION = 2;
+/**
+ * 每段发几次任务。1 次 × 双生 = 2 个候选。
+ *
+ * 曾经发 2 次想把候选凑到 4 个，但任务化之后并发提交的两个请求载荷完全相同，
+ * 第二个会被指纹账本并到同一个 task 上（实测 2026-11-09：只建单 1 次、只落 2 个 WAV，
+ * 4 张卡里 Take C/D 与 A/B 同 URL）—— 多发的任务不会再多一次建单，只会把同一对双生
+ * 画两遍，平白让用户以为有 4 个选择。两个真候选就发一次。
+ */
+export const TASKS_PER_SECTION = 1;
 
 /** 一次「生成候选」预期的候选数，只用于界面文案与骨架屏 */
 export const CANDIDATES_PER_SECTION = TASKS_PER_SECTION * CLIPS_PER_TASK;
@@ -215,6 +222,34 @@ export async function generateTakes(input: {
   }
 
   return { takes, sources: generated.map((audio) => audio.source) };
+}
+
+/**
+ * 器乐段候选的「只留本段」：上游 make_instrumental 不吃时长参数，一条前奏会写满整首
+ * （实测 205.560 / 189.504 s）。生成后立刻按规划秒数交给后端裁短，候选卡、锁定、时间轴
+ * 与成品才是同一个段长；不裁的话时间轴上会躺着一块 205.6 s 的「前奏」，而拼接时才
+ * 被砍到 8 s —— 两处口径对不上。
+ *
+ * 裁短失败保留原片（锁定后拼接仍会按 max_duration_sec 裁），把失败数交给调用方提示，
+ * 不把「没裁成」伪装成裁好了。
+ */
+export async function trimTakesToPlan(
+  takes: Take[],
+  maxDurationSec: number,
+): Promise<{ takes: Take[]; failed: number }> {
+  let failed = 0;
+  const trimmed = await Promise.all(
+    takes.map(async (take) => {
+      try {
+        const result = await trimAudio({ audioUrl: take.audioUrl, maxDurationSec });
+        return { ...take, audioUrl: result.audioUrl, duration: result.duration };
+      } catch {
+        failed += 1;
+        return take;
+      }
+    }),
+  );
+  return { takes: trimmed, failed };
 }
 
 /**

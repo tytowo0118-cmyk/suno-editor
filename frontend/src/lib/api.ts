@@ -6,6 +6,7 @@ import type {
   StructureCandidate,
   StructureJob,
   StructureJobStatus,
+  TrimResult,
 } from "./types";
 
 const rawBase = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
@@ -123,6 +124,43 @@ export async function stitchTimeline(segments: Array<{
     segmentStartSec: data.segment_start_sec ?? [],
     headTrimSec: data.head_trim_sec ?? [],
     truncateToSec: data.truncate_to_sec ?? [],
+  };
+}
+
+interface RawTrim {
+  audio_url: string;
+  filename: string;
+  duration: number;
+  source_duration: number;
+  trimmed: boolean;
+  snapped: boolean;
+}
+
+/**
+ * 把一段已在后端落盘的器乐 clip 裁到规划秒数。
+ *
+ * 上游器乐段（make_instrumental）会写满一整首，时间轴上按自然长度展开就成了
+ * 一块 205.6s 的「前奏」；生成完立即裁短，候选、锁定与成品才共用同一个段长。
+ * 只接受 /static 落盘地址 —— 这个接口不下载外链，也不碰任意本地路径。
+ */
+export async function trimAudio(input: {
+  audioUrl: string;
+  maxDurationSec: number;
+}): Promise<TrimResult> {
+  const data = await requestJson<RawTrim>("/api/trim", {
+    method: "POST",
+    body: JSON.stringify({
+      audio_url: input.audioUrl,
+      max_duration_sec: input.maxDurationSec,
+    }),
+  });
+  return {
+    audioUrl: data.audio_url,
+    filename: data.filename,
+    duration: data.duration,
+    sourceDuration: data.source_duration,
+    trimmed: data.trimmed,
+    snapped: data.snapped,
   };
 }
 

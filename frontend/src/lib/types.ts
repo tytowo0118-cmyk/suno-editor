@@ -41,6 +41,20 @@ export interface StitchResult {
   truncateToSec: (number | null)[];
 }
 
+/** 单段裁短结果：把器乐候选按规划秒数截成「只有本段」 */
+export interface TrimResult {
+  audioUrl: string;
+  filename: string;
+  /** 裁后时长；没超限时就是原片时长 */
+  duration: number;
+  /** 裁前时长，用来确认上游确实写满了整首 */
+  sourceDuration: number;
+  /** false = 原片本来就没超限，没有写新文件 */
+  trimmed: boolean;
+  /** 切点是否吸附到了 ±0.5s 内的结构候选；false = 直接停在目标秒数 */
+  snapped: boolean;
+}
+
 /** 某一秒段相对整条时间轴的起止位置 */
 export interface SectionTiming {
   startSec: number;

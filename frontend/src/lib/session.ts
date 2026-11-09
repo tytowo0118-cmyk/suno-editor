@@ -30,7 +30,7 @@ const SESSION_VERSION = 1;
 const MAX_LYRICS_LEN = 20_000;
 const MAX_PROMPT_LEN = 4_000;
 const MAX_LABEL_LEN = 64;
-/** 每段候选写盘上限：4 个初始候选 + 若干轮续写（每轮 2 条）；超出只是不进快照，不删文件 */
+/** 每段候选写盘上限：2 个初始候选 + 若干轮续写（每轮 2 条）；超出只是不进快照，不删文件 */
 const MAX_TAKES_PER_SECTION = 24;
 
 export interface StoredSection {
