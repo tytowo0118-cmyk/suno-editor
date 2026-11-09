@@ -23,6 +23,16 @@ import {
   DEFAULT_SONG_PROMPT,
   INITIAL_SECTIONS,
 } from "@/lib/sections";
+import {
+  captureSession,
+  loadSession,
+  mixFromStored,
+  parseSession,
+  saveSession,
+  sectionFromStored,
+  takeFromStored,
+} from "@/lib/session";
+import type { SessionSnapshot } from "@/lib/session";
 import type { Notice, NoticeLevel, StitchResult, Take, TimelineSection } from "@/lib/types";
 import SongBriefPanel from "./SongBriefPanel";
 import TakeCard from "./TakeCard";
@@ -36,22 +46,61 @@ function buildInitialPrompts(): Record<string, string> {
   return Object.fromEntries(INITIAL_SECTIONS.map((section) => [section.id, section.prompt]));
 }
 
+/**
+ * 会话快照只解析一次。用 useState 的惰性初始化而不是 ref：
+ * `react-hooks/refs` 不允许在渲染期读 `ref.current`，而这份快照恰恰要当首帧各种 state 的初始值用。
+ * 初始化函数只在挂载时执行一次，之后没人再调用 setter，所以它等价于「挂载时常量」。
+ * 整棵 Studio 是客户端专属组件（`app/page.tsx` 里 `dynamic(..., { ssr: false })`），
+ * 首帧直接拿它当初始值既没有 SSR 水合不一致，也不用「effect 里 setState」那种级联渲染。
+ */
+function useSessionSnapshot(): SessionSnapshot | null {
+  const [session] = useState(() => parseSession(loadSession()));
+  return session;
+}
+
+function restoreLockedTakes(session: SessionSnapshot | null): Record<string, Take> {
+  if (!session) return {};
+  return Object.fromEntries(
+    Object.entries(session.locked).map(([sectionId, take]) => [sectionId, takeFromStored(take)]),
+  );
+}
+
+/** 恢复结果直接做成首帧提示，而不是在 effect 里 setState：少一次渲染，也不会被时序坑 */
+function restoredNotice(session: SessionSnapshot | null): Notice | null {
+  if (!session) return null;
+  return {
+    text:
+      `已恢复上次现场：${session.sections.length} 段结构、${
+        Object.keys(session.locked).length
+      } 段已锁定${session.mix ? "、成品 1 份" : ""}；` +
+      "未锁定的候选音频存在浏览器内存里，刷新后留不住，需要重新生成",
+    level: "info",
+  };
+}
+
 export default function Studio() {
-  const [step, setStep] = useState<StudioStep>("brief");
-  const [structureReady, setStructureReady] = useState(false);
-  const [sections, setSections] = useState<TimelineSection[]>(INITIAL_SECTIONS);
-  const [activeId, setActiveId] = useState<string>(INITIAL_SECTIONS[0].id);
+  const session = useSessionSnapshot();
+  const [step, setStep] = useState<StudioStep>(() => session?.step ?? "brief");
+  const [structureReady, setStructureReady] = useState(() => Boolean(session?.structureReady));
+  const [sections, setSections] = useState<TimelineSection[]>(() =>
+    session ? session.sections.map(sectionFromStored) : INITIAL_SECTIONS,
+  );
+  const [activeId, setActiveId] = useState<string>(() => session?.activeId ?? INITIAL_SECTIONS[0].id);
   const [takes, setTakes] = useState<Record<string, Take[]>>({});
-  const [locked, setLocked] = useState<Record<string, Take>>({});
-  const [prompts, setPrompts] = useState<Record<string, string>>(buildInitialPrompts);
+  const [locked, setLocked] = useState<Record<string, Take>>(() => restoreLockedTakes(session));
+  const [prompts, setPrompts] = useState<Record<string, string>>(
+    () => session?.prompts ?? buildInitialPrompts(),
+  );
   const [loading, setLoading] = useState<Record<string, boolean>>({});
   const [errors, setErrors] = useState<Record<string, string | null>>({});
-  const [mix, setMix] = useState<StitchResult | null>(null);
+  const [mix, setMix] = useState<StitchResult | null>(() =>
+    session?.mix ? mixFromStored(session.mix) : null,
+  );
   const [mixCurrentTime, setMixCurrentTime] = useState(0);
   const [stitching, setStitching] = useState(false);
-  const [notice, setNotice] = useState<Notice | null>(null);
-  const [songPrompt, setSongPrompt] = useState(DEFAULT_SONG_PROMPT);
-  const [lyrics, setLyrics] = useState("");
+  const [notice, setNotice] = useState<Notice | null>(() => restoredNotice(session));
+  const [songPrompt, setSongPrompt] = useState(() => session?.songPrompt || DEFAULT_SONG_PROMPT);
+  const [lyrics, setLyrics] = useState(() => session?.lyrics ?? "");
   const [lyricsLoading, setLyricsLoading] = useState(false);
   const [lyricsError, setLyricsError] = useState<string | null>(null);
 
@@ -62,6 +111,8 @@ export default function Studio() {
   const requestSeq = useRef<Record<string, number>>({});
   // 结构重建后旧请求的响应必须作废，epoch 递增即失效
   const epochRef = useRef(0);
+  // 恢复出来的音频地址探一次活就够了（HEAD 幂等，但没必要每次重渲染都问一遍）
+  const probedRef = useRef(false);
 
   useEffect(() => {
     sectionsRef.current = sections;
@@ -113,6 +164,82 @@ export default function Studio() {
     const timer = window.setTimeout(() => setNotice(null), 3200);
     return () => window.clearTimeout(timer);
   }, [notice]);
+
+  /**
+   * 地址格式对 ≠ 文件还在：`static/` 被清过、换机器、换容器都会让快照里的 `/static` 地址变 404。
+   * 恢复完就并发探一次（HEAD，本地静态文件，不碰 Suno、不扣费），死链按「我们这边失败」处理 ——
+   * 点名是哪几段，把它们退回未锁定、成品作废，而不是留一个点开才报错的假锁定状态。
+   */
+  const probeRestoredAudio = useCallback(
+    async (snapshot: SessionSnapshot) => {
+      const labelsByUrl = new Map<string, string[]>();
+      const track = (url: string, label: string) => {
+        labelsByUrl.set(url, [...(labelsByUrl.get(url) ?? []), label]);
+      };
+      Object.entries(snapshot.locked).forEach(([sectionId, take]) => {
+        const title = snapshot.sections.find((section) => section.id === sectionId)?.title;
+        track(take.audioUrl, title ?? sectionId);
+      });
+      if (snapshot.mix) track(snapshot.mix.audioUrl, "成品");
+      if (labelsByUrl.size === 0) return;
+
+      const dead: string[] = [];
+      await Promise.all(
+        [...labelsByUrl.keys()].map(async (url) => {
+          try {
+            const response = await fetch(url, { method: "HEAD", cache: "no-store" });
+            if (!response.ok) dead.push(url);
+          } catch {
+            dead.push(url);
+          }
+        }),
+      );
+      if (dead.length === 0) return;
+
+      const deadSet = new Set(dead);
+      const lostLabels = dead.flatMap((url) => labelsByUrl.get(url) ?? []);
+      const nextLocked: Record<string, Take> = {};
+      Object.entries(lockedRef.current).forEach(([sectionId, take]) => {
+        if (take && !deadSet.has(take.audioUrl)) nextLocked[sectionId] = take;
+      });
+      lockedRef.current = nextLocked;
+      setLocked(nextLocked);
+      if (snapshot.mix && deadSet.has(snapshot.mix.audioUrl)) {
+        setMix(null);
+        setMixCurrentTime(0);
+      }
+      notify(
+        `恢复的 ${lostLabels.length} 条音频在后端磁盘上已经找不到了（${lostLabels.join("、")}）：` +
+          `相关段落已退回未锁定，需要重新生成；结构和歌词还在，不用重头再来`,
+        "error",
+      );
+    },
+    [notify],
+  );
+
+  // 恢复出来的地址探活；setState 全在 await 之后，不是 effect 体内的同步级联渲染
+  useEffect(() => {
+    if (!session || probedRef.current) return;
+    probedRef.current = true;
+    void probeRestoredAudio(session);
+  }, [session, probeRestoredAudio]);
+
+  // 现场一变就落盘：step / 歌词 / 段落 / 锁定 / 提示词草稿 / 成品（机制与取舍见 lib/session.ts）
+  useEffect(() => {
+    saveSession(
+      captureSession({
+        step,
+        structureReady,
+        songPrompt,
+        lyrics,
+        activeId,
+        sections,
+        locked,
+        prompts,
+        mix,
+      }),
+    );
+  }, [step, structureReady, songPrompt, lyrics, activeId, sections, locked, prompts, mix]);
 
   // Suno 按歌词自行决定演唱时长，时间轴以实际返回音频为准，不再强制对齐预估秒数
   const applyNaturalDuration = useCallback((sectionId: string, duration: number) => {
