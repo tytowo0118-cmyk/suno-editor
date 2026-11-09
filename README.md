@@ -5,10 +5,14 @@
 每段 4 选 1 锁定后，生成框自动切到下一段（可点时间轴回跳），最后由后端把各段按
 时间轴顺序硬切拼接成完整成品。
 
-当前阶段：**生成侧已切换为 Suno API 代理**。浏览器以 `multipart/form-data` 调用
-FastAPI 的 `POST /api/generate`（只传 `prompt`，由后端转发 Suno），拿到整段带人声的 WAV 后
-转为 Blob 播放；每段音频按返回的自然时长在时间轴上自适应展开，不再截断或拉伸到预估秒数。
-锁定 Take 时把音频上传到后端落盘，最终以 8 ms 微淡入淡出（近似硬切）拼接，避免人声重影。
+当前阶段：**生成侧已切换为 Suno API 代理，并且任务化 + 记账**。浏览器 `POST /api/generate/jobs`
+提交后立刻拿到 `job_id`，再轮询读阶段进度（提交建单 / 上游生成中 / 下载片段 / 转码 WAV / 已落盘），
+不再举着一条 HTTP 连接干等；片段由后端下载转码后直接落在 `static/output/`，候选引用的就是这个
+`/static` 地址而不是浏览器 Blob —— 锁定因此不必再上传一次，刷新也不会把候选变成死链。
+每段音频按返回的自然时长在时间轴上自适应展开，不再截断或拉伸到预估秒数。
+**建单成功即按载荷指纹记进后端账本**（`data/generate_cache.json`）：同样内容重试是免费重查那张
+已扣费的票据，片段已落盘时连上游都不请求，所以重复点击、刷新、后端重启都不会再花一次钱。
+最终以 8 ms 微淡入淡出（近似硬切）拼接，避免人声重影。
 成品波形可点选任意时间点，后端按 Suno 的 `continue_clip_id` / `continue_at` 从该点续写，
 一次任务的两个双生片段都挂为该段的新候选，试听满意再替换锁定。
 后端通过 `SUNO_API_BASE` / `SUNO_API_KEY` 调用真实 Suno 代理，未配置密钥时直接报错并提示；
@@ -31,13 +35,15 @@ FastAPI 的 `POST /api/generate`（只传 `prompt`，由后端转发 Suno），�
 │    └─ WaveformPlayer.tsx wavesurfer 波形；单实例协调 + 吸附刻度线 + 横向缩放  │
 │                                                                    │
 │  lib/lyrics.ts     歌词标签解析 → 段落 / 时长 / 提示词组装          │
-│  lib/musicgen.ts   POST /api/generate（FormData: prompt）→ 整段 WAV  │
-│  lib/api.ts        歌词生成 + 落盘 + 拼接请求，统一错误提取            │
+│  lib/musicgen.ts   POST /api/generate/jobs + 轮询 → /static 候选 WAV │
+│  lib/api.ts        歌词 / 拼接请求 + 通用任务轮询，统一错误提取       │
 └───────────────┬────────────────────────────────────────────────────┘
-                │ 全部走 FastAPI：生成 multipart / 其余 JSON
+                │ 全部走 FastAPI：JSON（生成已任务化，不再 multipart）
 ┌───────────────▼────────────────────────────────────────────────────┐
 │ FastAPI (127.0.0.1:8000)                                           │
-│ POST /api/generate  Suno 代理（提交 + 轮询 + 转 WAV）                │
+│ POST /api/generate/jobs  Suno 建单 + 进度轮询 + 扣费账本             │
+│ GET  /api/generate/jobs/{id}  阶段进度快照（内存表，重启即 404）      │
+│ POST /api/generate  同步版（保留兼容，同样吃账本）                   │
 │ POST /api/lyrics    LLM 写词（未配置时回退模板）                     │
 │ POST /api/assets    候选落盘                                        │
 │ POST /api/stitch    多段拼接（8ms 微淡入淡出）                       │
@@ -71,7 +77,8 @@ Suno 由后端代理调用，浏览器不再直连模型服务，也无需处理
 │   ├── requirements.txt
 │   ├── api/
 │   │   ├── assets.py             # POST /api/assets（候选 WAV 落盘）
-│   │   ├── generate.py           # POST /api/generate（Suno 提交 + 轮询 + 转 WAV + clip_id 索引）
+│   │   ├── generate.py           # Suno 提交 + 轮询 + 转 WAV + clip_id 索引 + 同步 /api/generate
+│   │   ├── generate_jobs.py      # POST/GET /api/generate/jobs（异步生成任务端点）
 │   │   ├── lyrics.py             # POST /api/lyrics（LLM 写词 + 本地模板兜底）
 │   │   ├── stitch.py             # POST /api/stitch
 │   │   └── structure.py          # POST /api/structure/boundaries + GET /api/analyze_structure
@@ -80,11 +87,16 @@ Suno 由后端代理调用，浏览器不再直连模型服务，也无需处理
 │   │   ├── structure_detector.py # 块余弦谱形状新颖度检测（纯 numpy）
 │   │   ├── structure_analyzer.py # allin1 分段 + 段归一化（毫秒、无缝）+ 本地/远程双角色
 │   │   ├── structure_weights.py  # 预训练权重自动下载与校验（allin1 fold + htdemucs）
+│   │   ├── analyze_jobs.py       # 结构分析任务表（按 clip 去重、单槽、64 条有界）
+│   │   ├── generate_jobs.py      # 生成任务表（按指纹去重、3 槽、阶段进度回调）
+│   │   ├── generate_cache.py     # 扣费账本：载荷指纹 → task_id / 已落盘片段（原子写、永不淘汰已付费票据）
 │   │   └── clip_index.py         # clip_id → 本地 WAV 路径索引（data/clip_index.json）
 │   ├── scripts/
-│   │   └── calibrate_structure.py # 零成本标定：本地重拼出毫秒真值，给两个检测器同一把尺子打分
+│   │   ├── calibrate_structure.py # 零成本标定：本地重拼出毫秒真值，给两个检测器同一把尺子打分
+│   │   ├── bench_structure_threads.py # 分析容器线程配比与耗时基准
+│   │   └── verify_generate_ledger.py # 零成本验证：假 Suno 上游 + 沙箱账本，27 项断言覆盖全部计费分支
 │   ├── vendor/madmom/models/     # madmom@main 缺失的 models 包替身（见 3.4 依赖表）
-│   ├── data/                     # 运行时状态：clip_id 索引（gitignore）+ 标定清单（提交）
+│   ├── data/                     # 运行时状态：clip_id 索引 + 扣费账本（gitignore）+ 标定清单（提交）
 │   └── static/                   # generated/ 候选、output/ 生成与拼接成品
 └── frontend/
     ├── Dockerfile                # node:24-slim，npm ci + next dev
@@ -124,8 +136,9 @@ interface TimelineSection {
 interface Take {
   id: string;              // "verse-1-a-mf3k2x"
   label: string;           // "Take A"
-  audioUrl: string;        // 生成后为 blob: URL；锁定落盘后为 /static/generated/*.wav
-  duration: number;        // 由音频元数据读取的真实时长（秒）
+  audioUrl: string;        // 后端 /static/output/*.wav 绝对地址（生成即落盘，跨刷新有效）
+  duration: number;        // 后端转码后 WAV 头的真实时长（秒），不再由浏览器解码估算
+  clipId?: string | null;  // Suno 侧 clip id，续写（continue_at）时作为源片段
 }
 
 interface StitchResult {
@@ -213,27 +226,30 @@ curl -X POST http://127.0.0.1:8000/api/lyrics \
 - **上限**：最多 12 段，超出部分截断并提示；结构更新会清空现有候选与锁定（有内容时二次确认），
   同时递增 epoch 让在途生成请求作废。
 
-### 2.3 `POST /api/generate` — Suno 代理（整段人声）
+### 2.3 `POST /api/generate` — Suno 代理（同步版，整段人声）
 
 `POST ${NEXT_PUBLIC_API_BASE}/api/generate`，默认 `http://127.0.0.1:8000/api/generate`。
-后端负责调用 Suno，浏览器不接触模型地址与密钥。
+后端负责调用 Suno，浏览器不接触模型地址与密钥。**前端主链路已改走 §2.9 的任务化端点**
+（`/api/generate/jobs`，提交 + 轮询 + 扣费账本）；这条同步接口保留给 curl / 脚本联调，
+两者共用同一个 `run_generation()`，因此账本、双生、续写、重试口径完全一致 ——
+同步版命中账本时同样不建单，响应头 `X-Suno-Source: cache`。
 
 | 项 | 要求 |
 | --- | --- |
 | 方法 | `POST` |
-| 请求体 | `multipart/form-data`（前端用 `FormData` 构建） |
+| 请求体 | `multipart/form-data`（curl / 脚本联调用；前端主链路已改走 §2.9 的 JSON 端点） |
 | `prompt` | string，必填；风格提示 + `[Section]` 标签 + 本段歌词 |
 | `duration` | 整数秒，**占位字段**；后端不再强依赖，实际时长由歌词决定 |
 | `continue_clip_id` | string，选填；上游片段 ID，非空时本次请求走**续写**（`metadata.task: "extend"`） |
 | `continue_at` | 浮点秒，选填（0–600）；续写起点，必须与 `continue_clip_id` 一起使用 |
 | `max_clips` | 整数，选填（默认 1，上限 2）；一次任务上游固定产出 2 个片段，取 2 时把第 2 个一并下载回传 |
-| 响应 | `audio/wav` 整段音频，无 JSON 包装；响应头 `X-Suno-Task-Id`、`X-Suno-Clip-Id` 回传本次音频的 ID，`X-Suno-Extra-Clips` 回传其余片段（base64 编码的 JSON 数组） |
+| 响应 | `audio/wav` 整段音频，无 JSON 包装；响应头 `X-Suno-Task-Id`、`X-Suno-Clip-Id` 回传本次音频的 ID，`X-Suno-Extra-Clips` 回传其余片段（base64 编码的 JSON 数组），`X-Suno-Source` 回传计费来源（`submit` / `refetch` / `cache`，见 §2.9） |
 
 - **初次生成不携带续写参数**：段落候选各自独立，段与段之间没有音频上下文；拼接只发生在最后一步。
 - **双生片段**：上游每个任务实际返回 `data[0]` 与 `data[1]` 两条片段，只取其一等于浪费一半额度。
   `max_clips=2` 时后端把两条都下载转码，第一条作为响应体，其余以
   `X-Suno-Extra-Clips: base64([{"clipId","url","duration"}])` 回传（`url` 指向 `static/output/` 下的 WAV）；
-  前端遍历数组，把它们挂为同一段落的独立子分支。三个自定义头都必须在 CORS
+  前端遍历数组，把它们挂为同一段落的独立子分支。四个自定义头都必须在 CORS
   `expose_headers` 里声明，否则跨端读取为空、续写与双生挂载会静默失效。
 - **续写（可选）**：把某个已生成 clip 在 `continue_at` 秒之前的音频交给上游作为创作上下文，
   返回一段以此为基础**重新生成**的续写音频。实测结果**不包含**原开头（与源音频前段的波形相关系数
@@ -243,9 +259,10 @@ curl -X POST http://127.0.0.1:8000/api/lyrics \
   `风格提示` + `[Section]` 标签 + `本段歌词`。标签由段落类型与序号生成
   （`[Intro]` / `[Verse 1]` / `[Chorus 2]` / `[Bridge]` …），编辑区下方的
   「发送格式」会实时显示当前标签。
-- **自然时长**：`duration` 传当前 `durationSec` 取整仅作占位；收到音频后用 `Audio`
-  元数据读取真实时长，回写 `sections[id].durationSec`（保留 0.1s），时间轴色块宽度与总长
-  随之自适应，不做任何截断/拉伸。锁定候选时以该候选的真实时长再次校准。
+- **自然时长**：`duration` 传当前 `durationSec` 取整仅作占位；真实时长由后端转码后的 WAV 头给出
+  （任务化端点放在 `clips[].duration`，同步版仍可由浏览器 `Audio` 元数据复核），前端据此回写
+  `sections[id].durationSec`（保留 0.1s），时间轴色块宽度与总长随之自适应，不做任何截断/拉伸。
+  锁定候选时以该候选的真实时长再次校准。
 - **4 选 1（2 次任务 × 双生）**：每段并发 `TASKS_PER_SECTION = 2` 次请求，每次带 `max_clips=2`，
   把同一任务的两条双生片段一并取回挂成候选，所以 **2 次任务出 4 个候选**
   （`CLIPS_PER_TASK` / `CANDIDATES_PER_SECTION` 与它同文件导出，页面文案、骨架屏张数都由此推导，
@@ -254,14 +271,18 @@ curl -X POST http://127.0.0.1:8000/api/lyrics \
   代价是每次任务已扣费的第 2 条整条扔掉 —— 上游一次任务固定产 2 条、同价，那等于白付一半额度。
   改成 2 次任务后每段少一次建单（约 ¥0.78/任务，3 段一首歌省约 ¥2.34，≈33%），候选从 3 个变 4 个。
 - **页面不自动生成**：进入某段不会自动发请求，必须点「生成候选」，避免误耗云端额度。
-- **残值片段取不回来不作废整次生成**：任务本身失败仍然整体失败并回收已生成的 Blob URL；
-  但某条 `X-Suno-Extra-Clips` 下载 404 / 解码失败时只少一个候选，已扣费的主片段照常可用 ——
-  与续写路径同一个判据（`generateTakes` 与 `continueTakes` 共用这条容错口径）。
-- **注入验证（零成本）**：浏览器里 monkeypatch `POST /api/generate`，用已扣费 WAV 作响应体、
+- **残值片段取不回来不作废已花的钱**：下载/转码阶段某一条失败时，已落盘的那几条**照样记进账本**
+  （`mark_ready(fp, newly)`，不是删掉重来），本次任务收敛成 `failed`（前端报错、不挂候选），
+  但重试同指纹走 `refetch`：不建单、只补缺的那一条。实测双生第二条下载 500 → 账本 `ready` 留 1 条，
+  重试 `download 18→19`、`submit` 不变（§2.9 有全表）。前端侧的容错口径不变：
+  extras 少一条只少一个候选，不会作废整次续写。
+- **注入验证（零成本，同步版时期）**：浏览器里 monkeypatch `POST /api/generate`，用已扣费 WAV 作响应体、
   `X-Suno-Extra-Clips` 回带第 2 条：2 次任务、表单 `max_clips=2`、候选 `Take A/B/C/D`；主片段时长由
   `Audio` 解码得 182.6 s，双生用响应头的 192.624 s；锁定双生 `Take B` 走真实 `/api/assets` 返回 200
   （落盘 33,979,014 B，与 `output/suno_1793930559_dfe622.wav` 同 md5）。再把双生 URL 换成 404 跑一次：
   保留 2 个主片段候选、不报错，文案自动变「2 选 1」。
+  **主链路换成任务化端点后这套注入也跟着换了**（拦 `/api/generate/jobs` 的 POST + GET，
+  候选直接指向已扣费的 `/static` WAV，锁定不再产生任何上传请求），实测见 §2.9 与第 4 节。
 - **候选 id 只能有一个命名槽**：双生曾经固定命名成 `${sectionId}-twin-${stamp}`，而一次「生成候选」
   会并发 2 个任务、每个任务各回带 1 条双生 —— 这 2 条的 `stamp` 来自同一次 `Date.now()`，id 完全相同。
   `key={take.id}`（Studio.tsx:668）和 TakeCard 的 `lockedTakeId === take.id` 都按 id 判同，于是
@@ -435,19 +456,29 @@ curl -X POST http://127.0.0.1:8000/api/generate \
 
 前端处理（`frontend/src/lib/musicgen.ts`）：
 
-1. 校验响应 `Content-Type` 与 `RIFF/WAVE` 魔数，`URL.createObjectURL(blob)` 后读取真实时长；
-   非 2xx、非 WAV 或解码失败都会提示错误。
+1. 主链路走 `runGenerateJob()`：`POST /api/generate/jobs` 拿 `job_id`，每 2 s 轮询一次直到终态，
+   每次状态变化都回调给界面画进度（见第 4 节）。候选地址是后端回的 `/static/output/*.wav`
+   补上 `API_BASE`，**不再下载成 Blob、也不再校验 RIFF 魔数**（落盘与转码都在后端完成）。
 2. 后端不可达时提示检查 FastAPI 与 Suno 代理是否已启动。
-3. 生成失败会同时写入当前段的错误面板和底部 Toast（包括未配置 Key 的 500）。
-4. 生成结果只存在于内存，锁定后才落盘（见 2.4）。
-5. 每个候选保存 `X-Suno-Clip-Id` 返回的 `clipId`（`Take.clipId`）；`continueTakes()` 用它发起续写，
-   并带上 `max_clips=2`，遍历 `X-Suno-Extra-Clips` 解码出的数组把每条残值片段下载成 Blob 后
-   以「续写分支 A / B」标签追加为该段的独立子分支（卡片序号沿用「候选项 04 / 05」，都停在待选择），不覆盖已锁定的音频；
-   残值片段下载失败只少一个候选，不会作废整次续写。
+3. 生成失败会同时写入当前段的错误面板和底部 Toast（包括未配置 Key 的 500），都是 `error` 级常驻。
+   失败文案只在后端 detail 没提记账时才补「已扣费并记账，重试不会再次计费」——
+   超时的 detail 自带那句，补两遍就是同一句安慰说两遍（实测浮层曾读作
+   「…免费重查这张票据；已扣费并记账，重试不会再次计费」，已修）。
+4. 生成结果**生成即落盘**，锁定不再上传（`/api/assets` 只兜历史 `blob:` 现场，见 2.4）。
+5. 每个候选保存 `clips[].clip_id`（`Take.clipId`）；`continueTakes()` 用它发起续写，
+   并带上 `max_clips=2`，把 `clips[1:]` 以「续写分支 A / B」标签追加为该段的独立子分支
+   （卡片序号沿用「候选项 04 / 05」，都停在待选择），不覆盖已锁定的音频。
+6. 计费来源由 `job.source` 如实给出，不靠耗时去猜：`billingNote()` 把一次「生成候选」的
+   多个任务汇总成一句提示（全 `cache` → 「复用已落盘结果，未再次计费」；全非 `submit` →
+   「重查已扣费任务取回结果，未再次计费」；混合 → 「本次建单 N 次，另 M 次复用已扣费结果」），
+   只在有免费复用时才弹，纯新建单不刷屏。
 
 ### 2.4 `POST /api/assets` — 候选落盘
 
-`blob:` URL 只存在于浏览器，`/api/stitch` 无法读取，因此锁定 Take 时先上传 WAV：
+**这条路径现在只兜历史现场**：生成任务化之后候选本身就是后端 `static/output/` 上的 WAV，
+锁定不再上传（实测锁定一次 `/api/assets` 请求都没有，见第 4 节）。它仍是系统里唯一的音频上传入口，
+服务于「浏览器里已经有一份 WAV 字节」的场景 —— 早期 `blob:` 候选只存在于浏览器，
+`/api/stitch` 读不到，必须先上传：
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/assets \
@@ -475,10 +506,10 @@ curl -X POST http://127.0.0.1:8000/api/assets \
   这条事故的另一半（提示本身活不过读完的时间）已由「提示分级」修掉：`保存音频失败` 现在是
   `error` 级常驻浮层，见第 4 节。
 - 落盘目录 `backend/static/generated/`，文件名由时间戳 + 随机串生成。
-- 前端在「锁定」时上传；失败则不锁定并提示，避免拼接时引用失效地址。这条失败是 `error` 级浮层，
-  常驻到手动关闭（见第 4 节「提示分级」），但后端文案仍要自解释 —— 上一条只写「上限」不写秒数，
-  用户即使来得及读也要自己算 60 MB 能用多久。
-- 这是系统里唯一的音频上传路径：生成请求不再携带音频，`/api/assets` 只服务于最终拼接。
+- 前端只在候选地址仍是 `blob:` 时才上传（历史现场兼容）；失败则不锁定并提示，避免拼接时引用失效地址。
+  这条失败是 `error` 级浮层，常驻到手动关闭（见第 4 节「提示分级」），但后端文案仍要自解释 ——
+  上一条只写「上限」不写秒数，用户即使来得及读也要自己算 60 MB 能用多久。
+- 这是系统里唯一的音频上传路径：生成请求不携带音频，新生成的候选由后端直接落盘，不经过这里。
 
 ### 2.5 `POST /api/stitch` — 多段拼接
 
@@ -692,12 +723,166 @@ Vite/Next 的重试把连接掐断，前面跑的分轨就白烧了。所以任�
 失败仍然不是异常：`failed` 带着 `detail` 和 `fallback_segments(duration)` 的单段区间，
 与 2.7 的降级契约同构，前端拿到的一定是合法结构。
 
-### 2.9 其他端点
+### 2.9 `POST /api/generate/jobs` + `GET /api/generate/jobs/{job_id}` — 异步生成与扣费账本
+
+2.3 那条同步接口有两个产品级缺口：一是浏览器举着一条连接干等几十秒到几分钟，界面只能写「生成中」，
+中间任何一层掐断连接就前功尽弃；二是**钱已经花了却没有任何凭据** —— 504 文案写着「可用该 task_id
+免费重查」，但 task_id 只存在于那次响应的异常里，刷新、重试、后端 `--reload` 之后谁都找不回来，
+于是「再点一次生成」就是第二张账单。这一节把两件事一起解决：任务化给进度，落盘账本给凭据。
+
+| 接口 | 参数 | 响应 |
+| --- | --- | --- |
+| `POST /api/generate/jobs` | JSON `{ "prompt": "…"(1–4000 字), "continue_clip_id"?: "…"(≤64), "continue_at"?: 0–600, "max_clips"?: 1–2 }` | 新任务 `202`；命中同指纹的在跑任务或已落盘结果 `200` + `reused: true` |
+| `GET /api/generate/jobs/{job_id}` | 路径参数 | 任务快照；表里没有（进程重启过）→ `404` |
+
+响应体（`GenerateJob.public()`）：
+
+```json
+{
+  "job_id": "3b9e3c9bea66",
+  "fingerprint": "a7b3bbc093dbfaa5b8c0bb7286c258e1",
+  "status": "done",
+  "phase": "done",
+  "final": true,
+  "elapsed_sec": 14.2,
+  "prompt_chars": 61,
+  "wanted_clips": 2,
+  "clips": [
+    { "clip_id": "8dd2ce7f…", "filename": "suno_1794207489_63e464.wav",
+      "duration": 32.088, "audio_url": "/static/output/suno_1794207489_63e464.wav" }
+  ],
+  "clip_count": 1,
+  "progress": { "upstream_status": "SUCCESS", "poll_ticks": 3, "lost_ticks": 0, "ready_clips": 2 },
+  "reused": false,
+  "task_id": "task_e8a1…",
+  "source": "submit",
+  "generate_ms": 14000
+}
+```
+
+`status ∈ queued / running / done / failed`，`phase ∈ queued / submitting / generating /
+downloading / transcoding / done / failed`（`phase` 比 `status` 细，用来画进度）。
+`progress` 是增量合并的：`upstream_status`、`poll_ticks`、`lost_ticks`、`ready_clips` 来自轮询，
+`clip_index` / `clip_total` / `clip_reused` 来自下载转码，`last_tick_lost` 是上一拍作废的原因
+（下一拍正常时会被清成 `null`，所以合并时连 `None` 一起写，不能只并 truthy 值）。
+`failed` 带 `detail`；`clips[].audio_url` 是 `/static` 相对地址，前端补 `API_BASE` 后直接播。
+
+**计费来源 `source` 是三态，不是布尔**：
+
+| source | 含义 | 有没有花钱 | 上游请求 |
+| --- | --- | --- | --- |
+| `submit` | 本次真建单 | 花了 | submit + fetch + download |
+| `refetch` | 账本里有已扣费票据，免费重查 | 没花 | 只有 fetch（+ 缺文件时 download） |
+| `cache` | 片段已在盘上且够用 | 没花 | **一个都不发** |
+
+前端据此说话（`billingNote()` / `describeGenerateJob()`），不靠耗时去猜「等这么久是不是又扣了」。
+
+#### 账本：载荷指纹 → 已扣费票据
+
+`utils/generate_cache.py`，落盘在 `backend/data/generate_cache.json`（gitignore）。
+
+- **指纹口径是「上游载荷」而不是「用户输入的 prompt」**：`build_payload()` 先做 §2.3 的人声保底
+  预处理（剔 `lo-fi`、追加 `clear vocal, lead vocal, vocal-driven`、把 `[Intro]` / `[Instrumental]`
+  头改写成 `[Verse 1]`），再对**改写后的载荷**去掉 `wait_audio` 这个传输开关，
+  按 `sort_keys=True` + 紧凑分隔符 + `ensure_ascii=False` 规范化成 JSON，取 sha256 前 32 位十六进制。
+  这样两份长得不一样、但归一后等价的 prompt 会命中同一条票据（实测 `lo-fi` 版与 `[Intro]` 版
+  指纹都是 `a7b3bbc093dbfaa5b8c0bb7286c258e1`）；而 `wait_audio` 只是「这次要不要阻塞等」，
+  进指纹会把同一张票据劈成两条；换 `SUNO_MODEL`（载荷里的 `mv`）则是**新指纹**，因为那确实是新的一次生成。
+- **三种状态，淘汰口径不同**：`submitted`（已建单已扣费，票据可免费重查）→ `ready`（WAV 已落盘）
+  → `failed`（**只有上游明确判死**才写：`FAILED_STATES` 或 `COMPLETE` 但没有音频）。
+  本地超时、下载失败、连接被掐都**不写 failed** —— 那些是「我们这边没拿到」，钱花了，票据必须留着。
+  只有 `failed` 允许再次付费提交。
+- **记账时机紧跟建单**：`_submit()` 一返回就 `mark_submitted(fp, task_id, payload)`，
+  中间不插任何可失败的 `await`。先记账再轮询，才谈得上「后面怎么崩都能免费重查」。
+- **原子写 + 有界**：`tempfile` 写完 `os.replace`，进程被杀不会留半截 JSON；上限 `_MAX_ENTRIES = 512`，
+  淘汰只动 `ready` / `failed`，**`submitted` 永不淘汰**（那是唯一能证明钱花在哪的凭据）。
+  文件损坏或 `version` 不符 → 当空账本，不抛异常打断生成。
+- **地址不可信就当作没有**：`ready` 条目里的文件名要过 `_wav_path()` 的目录穿越校验
+  （必须仍在 `static/output/` 下且真是文件）；探活失败的片段直接从条目里摘掉，
+  条目退回 `submitted` 语义走免费重下，而不是把死链当候选发出去。
+
+#### 任务表与轮询容错
+
+`utils/generate_jobs.py`，与 §2.8 的结构分析任务表同构，但去重键是**指纹**、并发是 3：
+
+- **按指纹去重**：`_by_fp` 只复用 `queued` / `running` 的任务，连点两下回同一个 `job_id`
+  （实测 `job_a == job_b`，HTTP `202/200`）。终态不复用：`done` 之后重新提交会走账本命中拿
+  `source=cache`，如实说明这次没花钱，而不是回一个旧 job 让人以为还在跑。
+- **本地限流 3 槽**：`asyncio.Semaphore(3)`。网关忙时并发建单会在接入队列里排队、握手 10 s 超时
+  （§2.3 有实测），放开并发只会抬失败率。槽位等待预算 `_SLOT_TIMEOUT_SEC = 900`，
+  等不到才 `failed`，文案写明「尚未建单，未扣费」。
+- **状态有界**：只留最近 64 条，表在进程内存里，`--reload` 即丢，所以 `404` 是预期分支。
+  前端 `pollUntilFinal()` 吃一次 404 就重新提交同指纹（后端账本还在 → 免费重查），
+  再 404 才判死并抛错，避免一个被重启抹掉的 id 把轮询挂成永续。
+- **两层容错各管一件事**：`_poll_once` 内部 1/2/4 s 退避共 4 次尝试，吸收单次握手失败；
+  击穿它才抛 `PollTickLost`，而这只作废**当前一拍**，睡到下一个间隔接着问，
+  直到 `SUNO_TIMEOUT`（默认 300 s，下限 10 s）才 504。`lost_ticks` 会如实上报给界面，
+  让「上游十几秒问不到」和「上游真的失败了」分辨得出来。
+
+前端轮询间隔 2 s（结构分析是 3 s），单拍请求失败不判死；取消（切段、重建结构、卸载）
+**只是不再等**，服务端任务继续跑完并记账，文案写「已停止等待；任务仍在服务端跑，
+结果会留在账本里，下次同样内容直接复用」。
+
+#### 零成本验证
+
+两套注入，都不碰真上游（真后端容器里有真 `SUNO_API_KEY`，任何真建单都是花钱）。
+
+**后端**：`docker exec museblocks-backend python scripts/verify_generate_ledger.py`。
+假 Suno 上游是本地 `ThreadingHTTPServer`（可编排 `pending / complete / failed / 503 / close /
+complete_no_audio` 与下载失败），沙箱把 `LEDGER_PATH` / `OUTPUT_DIR` / `clip_index.INDEX_PATH` /
+任务表 / 环境变量全部指到临时目录，音频素材用**已扣费**的 `suno_1793677292_700f18.wav`。
+**27/27 通过**，总计数 `submit 10 / fetch 220 / download 19`（submit 全部打向 `127.0.0.1`），
+关键几条：
+
+| 分支 | 实测 |
+| --- | --- |
+| 首次生成 | `status=done source=submit clips=2 poll_ticks=3`，`submit 1 / fetch 3 / download 2`，两个 WAV 真在盘上，时长 `[32.088, 32.088]` 与素材一致 |
+| 同指纹再提交 | `source=cache`，上游计数**一个都没动**，`generate_ms=5` |
+| 并发同指纹 | 回同一个 `job_id`，HTTP `202/200` |
+| 本地超时 | `detail=Suno 生成超时（10s，task_id=fake-task-3）；任务已扣费且已记账…`，账本 `state=submitted`；重试 `source=refetch submit=3→3 fetch=206→207` |
+| 上游判死 | 写 `failed`，之后才允许 `source=submit submit=4→5` |
+| 盘上文件被清 | `source=refetch clips=2 submit=5→5 download=8→10`（免费重下） |
+| 进程重启 | `GET → 404`，重新提交 `source=cache`，计数不变 |
+| 单次断连 | tick 内退避吸收，`lost_ticks=0 fetch=210→212`，任务照样 done |
+| 连续断连击穿退避 | 只作废一拍，`lost_ticks=1`，任务仍 done |
+| 双生第二条下载 500 | 第一条已兑现进账本（`state=ready landed=[…43de7f.wav]`），重试只补缺的那一条 `download=18→19 submit=8` |
+| 建单被拒 / 500 | **不留票据**（没花钱就不该记），`entries=512→512` |
+| 淘汰 | 灌到 cap 后 `entries=512`，`submitted` 仍在 |
+| 同步端点 | 命中账本不建单，`http=200 source=cache bytes=5660462`，双生第二条照旧回传 |
+
+**前端（真实 UI）**：浏览器里 monkeypatch `window.fetch`，拦下 `/api/generate/jobs` 的 POST 与 GET
+回放 scripted 状态，`clips` 指向 4 条**已扣费**的 `/static/output/*.wav`；
+任何漏网的 `/api/generate*` 请求一律回 599 而不落到真后端（实测 `blocked=[]`）。
+另起 100 ms DOM 采样器记录进度条文本、toast 与 `role="alert"`，绕开「浏览器工具一次往返 10–40 s、
+info 档 3.2 s 就消失」的观察窗口。实测：
+
+- 一次「生成候选」发 **2 个 POST**（`max_clips=2`，prompt 由风格 + 角色 + 首句意象 + 标签 + 歌词组装），
+  **14 个 GET**（每任务 7 拍），进度条依次出现
+  `提交建单 → 上游生成中 · 上游 IN_PROGRESS · 第 1 拍 → 第 2 拍 · 丢 1 拍（代理抖动，任务未判死）
+  → 上游 SUCCESS · 第 3 拍 → 下载片段 · 1/2 → 转码 WAV · 2/2 → 已落盘 · 本次建单已扣费`，
+  全程 **14.0 s**，挂载 `Take A/B/C/D` 四个候选，时长 `32.1 / 61.9 / 35.2 / 39.4 s` 与四条素材一致，
+  时间轴该段从 12 s 展开到 **32.1 s**、总长 44.1 s。
+- **锁定零上传**：锁 `Take A` 期间 `/api/assets` 请求数为 **0**（候选本身就是 `/static` 地址），
+  自动切到下一段；四条候选的 WAV 由 wavesurfer 直接从 `/static/output/` 取回 200。
+- **缓存命中**：第二段两个任务都回 `source=cache`，**GET 增量 0**，进度条写
+  「已落盘 · 复用已落盘结果，未再次计费」，toast 同句、存活 **3.18 s**（info 档自动消失）。
+- **免费重查**：`source=refetch` 时 GET 增量同样 0，文案「重查已扣费任务，未再次计费」，
+  toast「重查已扣费任务取回结果，未再次计费」存活 **3.21 s**。
+- **404 重提交**：第一个 job 吃一次 404 → **2.01 s** 后自动重新提交 → 两条任务都落盘、4 个候选、无报错。
+- **失败文案分工**：超时 detail 自带记账说明 → 浮层只说一遍
+  「生成失败：Suno 生成超时（10s，task_id=…）；任务已扣费且已记账，重试会免费重查这张票据」；
+  下载失败的 detail 只讲传输 → 前端补「；已扣费并记账，重试不会再次计费」。两者都是 `role="alert"` 常驻。
+- **拼接与跨刷新**：两段锁定后走**真实** `/api/stitch`（本地 DSP，免费）→ 200，成品 **62.75 s**、
+  峰值 **−3.5 dBFS**；刷新后快照 **1469 B**，`step=studio`、两段 32.1 s、两条锁定（真实 `/static` + clipId）、
+  成品 62.748 s / −3.45 dBFS 与下载链接全部回来。当时恢复提示写的是「未锁定的候选不写进快照…」；
+  候选纳入快照之后这句已改写，新的文案与实测见第 4 节「跨刷新恢复现场」。
+
+### 2.10 其他端点
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/` | 服务信息（`provider: suno-proxy`） |
-| GET | `/api/health` | `{ status, provider, suno_configured, sample_rate }` |
+| GET | `/api/health` | `{ status, provider, suno_configured, llm_configured, llm_model, sample_rate, generate_cache }`；`generate_cache` 是账本摘要 `{ entries, submitted, ready, failed }`，用来一眼看出「有多少张已扣费票据还活着」（实测真后端 `entries: 0` —— 全部验证都走沙箱与浏览器注入，没在真账本上花过钱） |
 | GET | `/static/...` | 落盘候选、生成 WAV 与拼接产物 |
 
 ---
@@ -1050,7 +1235,8 @@ demucs 都已经跑完了）。分析容器的 CMD 给服务进程带 `HF_HUB_OF
 | `lyricsLoading` / `lyricsError` | 歌词生成进行中与错误信息 |
 | `sections` | 当前时间轴顺序（初始由歌词解析生成，生成后按返回音频自然时长更新；dnd-kit 拖拽后 `arrayMove`） |
 | `locked` | `{ [sectionId]: Take }`，已锁定的候选；地址是后端 `/static` 上的文件，写进快照、刷新后能播 |
-| `takes` / `prompts` | 每个段落的候选列表与提示词草稿（候选的 `blob:` 地址不进快照，草稿进） |
+| `takes` / `prompts` | 每个段落的候选列表与提示词草稿；两者都进快照（候选地址同样是 `/static`，每段封顶 24 条、按 id 去重，见下方「跨刷新恢复现场」） |
+| `genJobs` | `{ [sectionId]: (GenerateJob \| null)[] }`，每段 2 个任务的最新进度快照，用来画阶段进度条（见下方「生成进度与计费语义」） |
 | `mix` / `stitching` | 拼接结果与进行中状态；成品的 `/static/output` 地址同样进快照 |
 | `notice` | 底部 toast，`{ text, level }`；`level` 决定它会不会自动消失（见下方「提示分级」） |
 
@@ -1065,19 +1251,36 @@ demucs 都已经跑完了）。分析容器的 CMD 给服务进程带 `HF_HUB_OF
   若歌词与提示词推导出的段落结构一致（id / 标题 / 提示词 / 歌词；**时长不参与比较**，
   因为它会被返回音频的自然长度改写）则直接返回，不重建；若有改动，会二次确认后清空
   候选 / 锁定 / 成品。重建结构时递增 `epochRef` 并清空 `requestSeq`，在途请求返回后
-  因版本不匹配被丢弃并回收 Blob URL，避免旧结构的音频串入新时间轴。
+  因版本不匹配被丢弃（历史 `blob:` 现场才需要顺手 `revokeObjectURL`），避免旧结构的音频串入新时间轴。
+  丢弃的只是「这次等待」：服务端任务已经建单的话仍会跑完并记账，下次同样内容免费复用。
 - **单一生成框 + 自动切段**：第二页只有一个生成框，点击时间轴色块切换当前段；
   锁定成功后自动切到下一段，最后一段锁定后提示可以生成成品。想改上一段时点时间轴即可回跳，
   已生成的候选与锁定状态都保留。
-- **显式生成**：进入页面不自动请求生成服务；选中结构块后点击「生成候选」才并发请求 3 次，
-  避免误耗云端额度。当前段歌词显示在段落标题下方，可边看歌词边调提示词。
+- **显式生成**：进入页面不自动请求生成服务；选中结构块后点击「生成候选」才并发提交 **2 个任务**
+  （每个带 `max_clips=2`，双生一并取回 → 4 个候选），避免误耗云端额度。
+  当前段歌词显示在段落标题下方，可边看歌词边调提示词。
 - **提示词组装**：请求只带 `prompt = 风格提示 + [Section] 标签 + 本段歌词`，不再上传
   `audio_file`，段落候选之间不传音频上下文（按成品波形点选续写见下方「按点续写」）；
   提示词输入框下方会显示当前发送的结构标签。
 - **自然时长**：候选返回后按第一个候选的真实时长更新该段 `durationSec`（已锁定的段以锁定
   音频为准），锁定候选时再次校准；时间轴宽度、总长与区间显示随之变化，音频不截断不拉伸。
-- **4 选 1 与落盘**：锁定前若音频是 `blob:`，先 `POST /api/assets` 落盘，成功后再写入 `locked`、
-  清除旧成品，并按该候选真实时长校准时间轴；失败则提示并保持未锁定。
+- **4 选 1（锁定不再上传）**：候选生成即落盘，地址就是后端 `/static/output/*.wav`，
+  所以锁定直接写入 `locked`、清除旧成品，并按该候选真实时长校准时间轴 —— 实测锁定一次
+  `/api/assets` 请求都没有。只有历史现场里残留的 `blob:` 地址才走上传落盘那条兜底分支，
+  失败则提示并保持未锁定。
+- **生成进度与计费语义**：生成框下方多一条进度面板，每个任务一行
+  （`任务 1/2 · 上游生成中 · 上游 IN_PROGRESS · 第 2 拍 · 6.0s · 丢 1 拍（代理抖动，任务未判死）`），
+  文案由 `describeGenerateJob()` 从 `phase` + `progress` 拼出，阶段词表是
+  `排队中 / 提交建单 / 上游生成中 / 下载片段 / 转码 WAV / 已落盘 / 失败`；
+  下载转码阶段带 `1/2` 这样的片段序号，终态不再显示耗时而是显示计费结论。
+  **计费语义单独成句、用绿色区分**，避免「等得久＝又花钱了」的误解：`submit` 终态写「本次建单已扣费」，
+  `refetch` 写「重查已扣费任务，未再次计费」，`cache` 写「复用已落盘结果，未再次计费」。
+  面板底部常驻一句机制说明：「刷新或关掉页面不会重复计费：建单成功即按内容指纹记进后端账本，
+  同样内容重试是免费重查那条已扣费的任务；片段已落盘时连上游都不请求。」
+  候选挂载后再由 `billingNote()` 汇总一次（只在有免费复用时弹 toast，纯新建单不刷屏）。
+  进度回调带 epoch + 段内序号双重守卫：切段或重建结构后迟到的旧任务快照不会画到新段上。
+  实测（零成本注入 + 100 ms DOM 采样器，全表见 §2.9）：7 个阶段按 2 s 一拍依次出现、
+  全程 14.0 s、4 个候选挂载、`blocked=[]`（没有任何请求落到真后端）。
 - **提示分级**：`notice` 是 `{ text, level }`，分级判据是「谁没做到该做的事」。`info`（用户操作
   还没满足条件、纯反馈）沿用 3.2 s 自动消失，`role="status"`；`error`（我们这边失败了 —— 网络、
   后端、扣费相关的丢失）常驻到用户点浮层里的「关闭」按钮，`role="alert"` + 玫红描边。全站 19 个
@@ -1091,39 +1294,75 @@ demucs 都已经跑完了）。分析容器的 CMD 给服务进程带 `HF_HUB_OF
   事故：钱已经花了，报错却在人读完之前消失，等于把唯一的证据藏起来。
 - **跨刷新恢复现场**：`lib/session.ts` 把已经花过钱的现场留在本标签页的 `sessionStorage`
   （键 `museblocks.session.v1`：`version / step / structureReady / songPrompt / lyrics / activeId /
-  sections / locked / prompts / mix / savedAtMs`），上述任一 state 一变就整份重写；读取只发生在挂载时的
+  sections / takes / locked / prompts / mix / savedAtMs`），上述任一 state 一变就整份重写；读取只发生在挂载时的
   `useState` 惰性初始化里，不在 effect 里 `setState` 回填 —— 新装的 `react-hooks/set-state-in-effect`
   把「effect 内同步 setState」判成错误（它会级联渲染，且首帧会闪一下默认值），而初值来自浏览器存储又必须
   避开 SSR：`app/page.tsx` 因此改成 Client Component 并用 `dynamic(() => import("@/components/Studio"),
   { ssr: false })` 挂载（Next 16 的 `lazy-loading` 指南明确 `ssr: false` 只能在客户端组件里用），
-  首帧直接以快照为初值，既没有水合不一致也没有二次渲染。恢复提示「已恢复上次现场：N 段结构、M 段已锁定…」
-  就是这一帧的 `notice` 初值（info，3.2 s 自动消失）。
-  **不落盘的两类东西**：未锁定候选的 `blob:` 地址只活在上一次页面进程里，写盘必成死链，而且比缺失更坏 ——
-  它会被当成「已锁定」送去拼接，所以 `captureSession` 与 `parseSession` 两头都只认 `^https?://` 且含
-  `/static/` 的地址；配色 / class 之类样式字段不写盘，恢复时由 `SECTION_STYLES[kind]` 现推，
-  快照被手改成什么样也只会被换回默认配色，不会把任意 class 注进 DOM。
+  首帧直接以快照为初值，既没有水合不一致也没有二次渲染。恢复提示「已恢复上次现场：N 段结构、M 段已锁定、
+  K 条候选…」就是这一帧的 `notice` 初值（info，3.2 s 自动消失）；K 按**实际回填的列表**算而不是按快照字段算，
+  否则旧快照（没有 `takes`）会报「0 条候选」而下方明明有一张由锁定项兜出来的卡片。
+  **未锁定候选也写盘**：生成改成任务式之后，候选与锁定一样是后端 `/static` 上的绝对地址，刷新不会变死链；
+  不写盘的代价反而是现场自相矛盾 —— 时间轴写着「已锁定 Take A」，下方卡片却是「暂无候选」。
+  写盘与锁定共用一份序列化（`toStoredTake`），并且**有界**：每段最多 `MAX_TAKES_PER_SECTION = 24` 条
+  （4 个初始候选 + 若干轮续写），超出只是不进快照、不删文件；按 take id 去重，因为 `key={take.id}` 与
+  `lockedTakeId === take.id` 都按 id 判同，塞进两条同 id 会让 React 报重复 key、锁一条连带把另一条标成已锁定。
+  `version` 仍是 1：`takes` 是**新增可选字段**，旧快照读成 `{}` 再由锁定项兜出一条候选，
+  不因为加了一个字段就把用户已经花过钱的现场整份判废。兜底只在该段列表**为空**时做 ——
+  `loadTakes` 是整段替换候选但保留锁定的，「锁定项不在候选列表里」是合法状态，不能无条件塞回去。
+  **不写进快照的东西**只剩两类：一是 `blob:` 这种只活在上一次页面进程里的地址（写盘必成死链，
+  而且比缺失更坏 —— 它会被当成「已锁定」送去拼接）；二是配色 / class 之类样式字段，恢复时由
+  `SECTION_STYLES[kind]` 现推，快照被手改成什么样也只会被换回默认配色，不会把任意 class 注进 DOM。
+  地址校验口径没放松：`captureSession` 与 `parseSession` 两头都只认 `^https?://` 且含 `/static/`。
   **校验口径是「不成形就整份作废」而不是「尽力修补」**：`version` 不等、`sections` 缺失或全部非法 → 直接
   当没有快照（回默认 3 段第一页）；单条里 kind 必须在 `SECTION_META` 白名单、时长 0–600 s（NaN / 越界 → 8 s）、
-  文本按上限截断（歌词 20k、提示词 4k、标签 64），`locked` 与 `prompts` 的键必须还能对上现存的段 id，
-  `activeId` 找不到就退回第一段。成品的 `segment_start_sec` 是第二条色带与续写落点唯一的坐标依据，
-  与 `segment_order` 长度不等就整条成品作废；`head_trim_sec` / `truncate_to_sec` 是审计字段，
-  长度不齐时整条换成默认填充（全 0 / 全 null）而不是留半截 —— 下游按下标取值，留半截会读到 `undefined`。
+  文本按上限截断（歌词 20k、提示词 4k、标签 64），`takes` / `locked` / `prompts` 的键必须还能对上现存的段 id，
+  `activeId` 找不到就退回第一段。候选列表是**逐条**过滤的（坏一条不连坐整份，也不连坐整个快照）：
+  列表里塞 `null` / `{}` / 数字只丢那一条，某段整体不成形则该段键不出现。成品的 `segment_start_sec`
+  是第二条色带与续写落点唯一的坐标依据，与 `segment_order` 长度不等就整条成品作废；
+  `head_trim_sec` / `truncate_to_sec` 是审计字段，长度不齐时整条换成默认填充（全 0 / 全 null）而不是留半截 ——
+  下游按下标取值，留半截会读到 `undefined`。
   **地址格式对 ≠ 文件还在**：`static/` 被清过、换容器、换机器都会让快照里的 `/static` 地址变 404，
-  所以恢复后并发对每条地址探一次活（`HEAD`，纯本地静态文件，不碰 Suno、不扣费），死链按「我们这边失败」处理：
-  从 `locked` 里摘掉、成品直接作废，并以 error 级提示点名是哪几段，而不是留一个点开才报错的假锁定状态。
-  实测（零扣费：`/api/generate` monkeypatch 成已扣费静态 WAV，落盘与拼接走真后端）：2 段各锁 1 条 + 拼好成品后
-  快照 1448 B，刷新后第一页 / 第二页停在 `studio`、两段自然时长（主歌 8 s、副歌 8 s）、两条锁定、成品下载链接
-  全部回来；把 2 个 take WAV 与成品移出 `static/` 再刷新 → 提示变成「恢复的 3 条音频在后端磁盘上已经找不到了
-  （主歌、成品、副歌）：相关段落已退回未锁定…」，`locked` 清零、链接消失，而段落与歌词原样保留（探活单条
-  HEAD 6.9–11.6 ms，404 那 6.2 ms）。种一份 `version: 2` 或非 JSON 的脏快照 → 界面回落到默认 3 段第一页，
-  `locked` 里塞的 `<img src=x onerror=…>` 没有进 DOM；种一份合法但锁定项是 `blob:`、成品也是 `blob:` 的快照 →
-  段落与 `step` 照常恢复，提示为「1 段结构、0 段已锁定」。纯函数侧另有一份容器内往返测试跑 46 项断言
-  （写盘→`JSON` →读回，含 blob 丢弃、越界时长、孤儿 `activeId`、审计数组半截等分支），全绿；恢复提示的文案与
-  `role="alert"` 渲染是把 `level` 临时钉成常驻才在 DOM 读到的 —— info 档 3.2 s 就消失，而浏览器工具一次往返
-  要 10–40 s，来不及观察，代码里已改回 `info`。
+  所以恢复后对每条地址探一次活（`HEAD`，纯本地静态文件，不碰 Suno、不扣费），并发封顶
+  `PROBE_CONCURRENCY = 8`（满配 12 段 × 24 条一次性放出去会打满本地静态服务与本页连接数），
+  同一个 URL 只探一次（锁定项通常也在候选列表里）。死链按「我们这边失败」处理，但**三种后果分开说**：
+  锁定项没了 → 该段退回未锁定；候选没了 → 从列表里剔除；成品没了 → 作废。
+  剔除以**当前** state 为准，且只认「恢复出来的 take id」白名单：探活是异步的，期间用户可能已经点了
+  「生成候选」，新花钱拿到的候选不能被这次结果误伤。点名到「段 + Take」，超过 6 个名字折叠成
+  「… 等 N 处」（24 条全丢时把名字铺满浮层，反而看不清丢了几条）；死链若全属于已被替换掉的旧列表，
+  当前界面不再指向它们，就不报警。提示是 error 级常驻。
+  实测（零扣费：`window.fetch` 拦 `/api/generate/jobs` 回真实形状的 job JSON，片段指向四条**已扣费**的静态
+  WAV；全程只出现 `127.0.0.1:8000` 一个 host，真账本仍无文件即 `entries: 0`、`static/output/` 无新文件）：
+  点「生成候选」→ **2 个 POST + 2 个 GET** → 4 个候选，快照 **1285 B**；锁 `Take B` → **0** 个网络请求、
+  快照 **1461 B**；刷新 → **4 个 HEAD**（锁定项与候选 B 同 URL 去重）全部 200、单条 **208–211 ms**
+  （此时波形也在取回同四条 WAV）、四条在 4 ms 内并发发出，4 张卡片与 `Take B` 的「已锁定」徽章全部回来，
+  波形在 shadow DOM 里渲染出 **8 个 canvas**，恢复提示读作「已恢复上次现场：3 段结构、1 段已锁定、4 条候选；
+  音频都是后端落盘地址，正在核对文件是否还在（缺的会被点名剔除）」。
+  把 2 条候选地址改成不存在的文件再刷新 → 「恢复的 2 个音频文件在后端磁盘上已经找不到了：2 条候选已剔除
+  （主歌 Take A、主歌 Take C）」，卡片 **4 → 2**、锁定与时间轴不受影响、快照 **1460 → 1136 B**，
+  且**没有**谎称「已退回未锁定」。把锁定项与成品一起改成死链 → **5 个 HEAD（2 个 404）**、
+  「主歌（已退回未锁定）；成品已作废；1 条候选已剔除（主歌 Take B）」，卡片 **4 → 3**、`locked` 清零、成品消失。
+  8 条候选 + 锁定 + 成品全死 → 「恢复的 **9** 个音频文件…」（锁定与候选 A 同 URL 去重）、名字折叠成
+  「主歌 Take A、…、主歌 Take F 等 **8** 处」、卡片归零、快照 **2093 → 622 B**。
+  删掉快照的 `takes` 字段模拟旧现场 → 恰好兜出 **1** 张卡片（锁定那条）、**1** 个 HEAD 200、
+  提示写「1 段已锁定、1 条候选」。种一份 `version: 2` 或非 JSON 的脏快照 → 界面回落到默认 3 段第一页，
+  `locked` 里塞的 `<img src=x onerror=…>` 没有进 DOM；种一份合法但锁定项与成品都是 `blob:` 的快照 →
+  段落与 `step` 照常恢复，锁定、候选与成品全部被丢弃。
+  纯函数侧另有一份容器内往返测试：把仓库里真实的 `src/lib/{session,lyrics,sections,types}.ts` 原样复制进
+  `/tmp` 用 `tsc` 编译成 CommonJS 再交给 node 跑（宿主机没有 node），**46/46 通过** —— 覆盖候选保序往返、
+  `blob:` / 相对地址 / `javascript:` / `ftp:` 全部丢弃、30 条封顶到 24、同 id 去重（写盘与读回两侧）、
+  孤儿段 id、旧快照无 `takes` 不判废、`takes` 是字符串 / null / 数组 / 列表里塞 null 的脏形状、
+  越界时长与超长 label 兜底、`saveSession` / `loadSession` 真走一遍 stub `sessionStorage`
+  （含配额抛异常静默降级、坏 JSON 读成 null）、成品审计数组对齐回归。体量实测：满配 12 段 × 24 条 =
+  **49933 B（48.8 KB）**，典型「3 段 / 4 候选 / 1 锁定」= **1680 B**，离 5 MB 配额很远。
+  门：`tsc --noEmit` 与 `eslint src --max-warnings=0` 均为 **0**。
+  info 档文案这次是用 `navigate_page` 的 `initScript` 在页面脚本之前装一个 80 ms 的 `.toast-enter` 采样器
+  读到的，没有再临时改 `level`；注意**不能**用 `[role="status"]` 选浮层 —— 时间轴里另有一个空的
+  `role="status"` live region 会抢在前面，采样器会一直读到空串。
 - **播放协调**：`WaveformPlayer` 内部维护模块级 `activeInstance`，任一实例开始播放会暂停其他实例；
   `pauseAllAudio()` 在切换段落 / 重排 / 锁定 / 拼接 / 切换页面时统一调用。播放按钮的 `aria-label`
-  在「播放试听 / 暂停试听」之间切换。Blob URL 在被替换时统一 `revokeObjectURL` 回收。
+  在「播放试听 / 暂停试听」之间切换。新候选是 `/static` 地址、无需回收；
+  `revokeTakeAudio()` 只对历史 `blob:` 现场调 `revokeObjectURL`。
 - **重排**：拖拽（鼠标手柄或键盘 Space + 方向键 + Space）后重新计算时间轴区间与总时长，并清空过期成品。
 - **拼接**：按时间轴顺序收集已锁定 Take（至少 2 段）调用 `/api/stitch`，`crossfade_ms` 固定 8；
   未全部锁定时提示「将只拼接已锁定段落」，全部锁定后按钮高亮，展示成品波形与 WAV 下载链接。
@@ -1153,8 +1392,11 @@ demucs 都已经跑完了）。分析容器的 CMD 给服务进程带 `HF_HUB_OF
   段落候选。成品波形点击（wavesurfer `interaction`）记下落点并显示白色标记线，用
   `segment_start_sec` 反查「哪一段 · 段内第几秒」（加上该段的 `head_trim_sec` 才回到源片段自身时间轴）；
   在续写歌词框写词后点「从此处续写」，以该段的 `clipId` + 段内偏移、`max_clips=2` 调用
-  `/api/generate`，主片段与 `X-Suno-Extra-Clips` 里的残值片段一并作为新候选追加到该段下方
+  `/api/generate/jobs`，`clips[]` 里的两条片段一并作为新候选追加到该段下方
   （「候选项 04 / 05」，都是待选择，已锁定的那条不动），试听后再决定是否锁定。
+  续写同样吃账本：等待期间按钮下方多一行「续写任务 · …」，用的是与生成框同一套阶段进度
+  （组件内 `extendJob` state），命中已扣费结果时该行带「重查已扣费任务，未再次计费」或
+  「复用已落盘结果，未再次计费」，完成 toast 再补一句「；复用已扣费结果，未再次计费」。
   落点离段首/段尾过近（< 0.2s / 剩余 < 0.5s）或该段缺少片段 ID 时按钮禁用并说明原因。
 - **播放头吸附**：`WaveformExtendPlayer` 挂载后对成品调一次 `POST /api/structure/boundaries`
   （491.883 s 的成品服务端 1068 ms 返回，见 2.6），候选以 `StructureCandidate[]` 透传给 `WaveformPlayer`。
@@ -1299,9 +1541,12 @@ docker compose down              # 停止并移除容器
   （slim 镜像不含 curl/wget）。前端通过 `depends_on: service_healthy` 等后端就绪后再启动。
 - **音频产物留存**：Suno 返回的 WAV、落盘候选与拼接成品写入挂载目录
   `backend/static/generated|output`，重建容器不会丢失。
-- **Suno 代理**：浏览器只请求后端 `/api/generate`，Suno 的提交、轮询、下载与转码都在
+- **Suno 代理**：浏览器只请求后端 `/api/generate/jobs`（提交 + 轮询），Suno 的提交、轮询、下载与转码都在
   `backend/api/generate.py` 内完成；容器无需暴露模型端口，前端也不接触密钥。
   未配置 `SUNO_API_KEY` 时接口返回 500，前端会显示错误面板与 Toast。
+- **扣费账本留存**：`backend/data/generate_cache.json` 与 `clip_index.json` 同样在挂载目录里，
+  重建容器不会丢失 —— 这很重要，账本丢了就等于把「已经花过钱」的凭据丢了，重试会重新建单。
+  两个文件都 gitignore（含 task_id 与本地路径，不该进版本库）。
 - **LAN 访问**：浏览器若通过局域网 IP 打开前端，需要在根目录创建 `.env`：
 
   ```bash
@@ -1362,7 +1607,7 @@ npm run dev        # http://127.0.0.1:3000
 ```
 
 - 后端地址通过 `NEXT_PUBLIC_API_BASE` 覆盖，默认 `http://127.0.0.1:8000`；
-  生成同样走该地址的 `/api/generate`，前端没有单独的模型地址配置。
+  生成同样走该地址的 `/api/generate/jobs`，前端没有单独的模型地址配置。
 - `next.config.ts` 已配置 `allowedDevOrigins: ["127.0.0.1", "localhost"]`，避免 Next 16 拦截开发资源。
 - 如果改动了 `.env*` 或 `next.config.ts`，需要重启 Next dev 进程。
 
@@ -1375,13 +1620,16 @@ npm run dev        # http://127.0.0.1:3000
    在保留模块化编辑的同时提升连贯性。
 2. **歌词可控性**：为 `/api/lyrics` 增加押韵、字数、人称、中英混排等参数，并用结构化输出
    （JSON Schema 或 function calling）替代文本后校验，失败时自动重试或多候选择优。
-3. **进度推送与缓存**：Suno 单次生成耗时较长，当前是同步长请求；可把轮询结果通过 SSE /
-   WebSocket 推给前端显示进度，并以 `sha256(prompt | tags | model)` 缓存结果，避免重复计费。
+3. **进度推送与缓存（已实现，见 §2.9）**：生成已任务化 —— 提交拿 `job_id`、2 s 轮询读阶段进度，
+   并以**上游载荷指纹**（不是裸 prompt）落盘记账，重复点击 / 刷新 / 后端重启都不会再扣一次费。
+   下一步可做的是把轮询换成 SSE / WebSocket 推送（省掉空转的 GET，代价是多一条长连接与断线重连口径），
+   以及给账本加用户维度与过期策略（现在 512 条上限、`submitted` 永不淘汰，长期跑只增不减）。
 4. **拼接质量**：即使采用 8ms 微淡入淡出，段落间仍可能有响度/节奏差异；可做响度归一化、
    BPM 估计与节拍对齐，再处理接缝。
 5. **数据持久化**：工作现场已有浏览器侧的一层（`sessionStorage` 快照 + 落盘地址探活，见第 4 节），
-   但它只在一个标签页内有效、关掉标签即失效；下一步可加服务端会话表，把创作设定、时间轴与锁定音频
-   做成跨设备可恢复，并把未锁定候选一并落盘（现在只有锁定的那条才写盘）。
+   结构、歌词、提示词草稿、**每段候选（封顶 24 条）**、锁定与成品都在里面；
+   但它只在一个标签页内有效、关掉标签即失效。下一步可加服务端会话表，把这份现场做成跨设备可恢复
+   （代价是要引入用户维度、鉴权与音频文件的归属/清理策略，现在 `static/output/` 是全局共享的）。
 6. **时长模型**：初始时长仍按「每句 4s」估算，可结合语速、BPM 与段落角色做更精细的预览。
 7. **结构检测升级**：3.3 的谱形状新颖度只够当吸附候选（精确率 10.8%，且对 floor 敏感）。
    要让它参与自动分段，需要换成训练过的边界检测模型，而这类模型基本依赖 torch ——
@@ -1426,17 +1674,24 @@ npm run dev        # http://127.0.0.1:3000
   推理是分钟级 CPU 活儿（四条冷跑合计 1.02× 实时）且分析容器一次只跑一条流水线
   （排队预算 `max(AIO_QUEUE_TIMEOUT=900 s, 1.5 × 时长)` 拿不到就 429 → 主后端降级），
   所以它不进生成主链路，只在成品就绪后按需调用；权重首次下载需要联网（HF + fbaipublicfiles）。
-- `/api/generate` 是同步长请求：提交后在后端轮询到完成才返回，期间浏览器连接一直挂起；
-  前端目前只显示「生成中」，没有中间进度。
+- 生成主链路是「提交 + 2 s 轮询」（§2.9），进度只到**阶段级**（建单 / 上游生成中 + 拍数 / 下载第几条 /
+  转码 / 已落盘），不是百分比：上游不给完成度，硬造一个百分比只会骗人。同步版 `/api/generate`
+  仍保留给脚本联调，它才是那条会一直挂起浏览器连接的长请求。
+- 生成任务表在进程内存里，后端 `--reload` / 重启即丢，`GET /api/generate/jobs/{id}` 会 404；
+  前端吃一次 404 就免费重提交同指纹（账本在盘上，不会重复计费），再 404 才判死。
+  账本没有用户维度也没有过期策略，`submitted` 条目永不淘汰，长期跑只增不减。
 - 一次任务的两条双生片段都会取回并各挂一个候选（`max_clips=2`，机制见 §2.3）；同一段的 4 个候选
   背后是 2 个独立任务，同一任务的两条片段共享 prompt，因此相关性高于跨任务的两条。
 - 未配置 `SUNO_API_KEY` 时接口返回 500，页面会提示检查后端环境变量。
-- 未锁定候选以 Blob 存在内存里，锁定后才落盘，因此**刷新会丢的就是这些候选**：快照只留得住歌词、结构、
-  提示词草稿、已锁定 Take 与成品（机制与校验口径见第 4 节），恢复提示会如实写出「未锁定的候选音频存在
-  浏览器内存里，刷新后留不住，需要重新生成」。
+- 候选**生成即落盘**在后端 `static/output/`，刷新不会把地址变成死链，因此**未锁定候选也进快照**
+  （每段封顶 24 条、按 id 去重，满配 12 段实测 48.8 KB）。超出封顶的续写分支不进快照：文件与账本都还在，
+  再点一次「生成候选」会命中账本（`source=cache` 或 `refetch`）免费取回，但那一份列表不再背它们。
+  快照里的候选地址同样可能被清理，恢复阶段会探活并点名剔除（见下条）。
 - 会话快照是 `sessionStorage`，作用域只有**当前标签页的这一次会话**：关掉标签页、换浏览器、换设备都不在，
-  也不写进 URL，所以没有可分享的链接；`step` 仍是客户端状态。已锁定 Take 与成品的地址指向后端磁盘，
-  文件被清掉时恢复阶段会探活出来并把相关段落退回未锁定（点名到段），但**不会**把音频找回来。
+  也不写进 URL，所以没有可分享的链接；`step` 仍是客户端状态。候选、已锁定 Take 与成品的地址都指向后端磁盘，
+  文件被清掉时恢复阶段会探活出来：锁定项退回未锁定、候选从列表剔除、成品作废，并以 error 级常驻提示
+  点名到「段 + Take」（超过 6 个名字折叠成「等 N 处」），但**不会**把音频找回来 ——
+  要拿回得再点一次生成，那一次是否免费取决于后端账本是否还在（换容器 / 清 `data/` 就不在了）。
 - 音频统一重采样到 44.1 kHz，长素材会带来内存开销（当前上限 60 MB）。
 - 拼接是 8ms 微淡入淡出的时域硬切，不做节拍对齐 / BPM 匹配 / 响度归一化；
   若两段响度差异明显，接缝仍可能可闻。

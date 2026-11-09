@@ -16,9 +16,11 @@ from fastapi.staticfiles import StaticFiles
 
 from api.assets import router as assets_router
 from api.generate import router as generate_router
+from api.generate_jobs import router as generate_jobs_router
 from api.lyrics import router as lyrics_router
 from api.stitch import router as stitch_router
 from api.structure import router as structure_router
+from utils import generate_cache
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,13 +46,14 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
-    # 不声明的话浏览器读不到这三个头，续写与双生片段挂载会静默失效
-    expose_headers=["X-Suno-Task-Id", "X-Suno-Clip-Id", "X-Suno-Extra-Clips"],
+    # 不声明的话浏览器读不到这几个头，续写、双生片段挂载与计费来源提示会静默失效
+    expose_headers=["X-Suno-Task-Id", "X-Suno-Clip-Id", "X-Suno-Extra-Clips", "X-Suno-Source"],
 )
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 app.include_router(assets_router)
 app.include_router(generate_router)
+app.include_router(generate_jobs_router)
 app.include_router(lyrics_router)
 app.include_router(stitch_router)
 app.include_router(structure_router)
@@ -79,5 +82,7 @@ def health() -> dict:
         "llm_configured": bool(llm_base and llm_key),
         "llm_model": os.environ.get("LLM_MODEL", "").strip() or "gpt-4o-mini",
         "sample_rate": 44_100,
+        # 已扣费票据的规模，验证「重试有没有再花钱」时先看这里
+        "generate_cache": generate_cache.summary(),
     }
 

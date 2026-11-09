@@ -20,7 +20,7 @@ export interface TimelineSection {
 export interface Take {
   id: string;
   label: string;
-  /** Blob URL（刚生成）或后端 /static 地址（已落盘） */
+  /** 后端 /static 绝对地址（生成即落盘，跨刷新有效）；blob: 仅历史现场兼容 */
   audioUrl: string;
   duration: number;
   /** Suno 侧的 clip id，续写（continue_at）时作为源片段 */
@@ -48,14 +48,15 @@ export interface SectionTiming {
 }
 
 /** 结构候选：sec 是成品时间轴上的秒数。strength 是谱新颖度（仅检测器给），
- *  source 标出这条证据来自哪里 —— 检测器定位到毫秒但没有语义，模型带语义标签但只到 ±0.1~0.5 s。 */
+ *  source 标出这条证据来自哪里 —— 检测器定位到毫秒但没有语义；模型带语义标签，
+ *  但边界不能当裁切真值（实测对全部 9 条真接缝的最近边界误差中位数 1.624 s、最差 10.667 s）。 */
 export interface StructureCandidate {
   sec: number;
   strength: number;
   source?: "detector" | "model";
 }
 
-/** 深度学习结构模型的分段：带 intro/verse/chorus 语义标签，边界定位精度 ±0.1~0.5 s */
+/** 深度学习结构模型的分段：带 intro/verse/chorus 语义标签，边界只作吸附参考不作裁切真值 */
 export interface StructureSegment {
   label: string;
   start: number;
@@ -78,6 +79,58 @@ export interface StructureJob {
   detail?: string;
   reused: boolean;
   model: string;
+}
+
+export type GenerateJobStatus = "queued" | "running" | "done" | "failed";
+
+/**
+ * 本次生成的计费来源，是唯一权威 —— 不要靠耗时去猜有没有花钱。
+ * submit = 真的建单扣费；refetch = 账本里有已扣费票据，这次只做免费重查；
+ * cache = WAV 已在盘上，连上游都没请求。
+ */
+export type GenerateSource = "submit" | "refetch" | "cache";
+
+/** 生成任务落盘的片段：后端已转成 44.1 kHz 立体声 WAV，时长由 wave 头读出 */
+export interface GenerateJobClip {
+  clipId: string | null;
+  filename: string;
+  duration: number;
+  /** 后端相对地址（/static/output/...），拼上 API_BASE 即可直接播放，跨刷新有效 */
+  audioUrl: string;
+}
+
+/** 生成进度的增量字段，由后端每次阶段变化合并上报 */
+export interface GenerateJobProgress {
+  upstreamStatus?: string;
+  pollTicks?: number;
+  lostTicks?: number;
+  readyClips?: number;
+  clipIndex?: number;
+  clipTotal?: number;
+  clipReused?: boolean;
+  /** 最近一次作废的轮询 tick 的原因；问到了就清成 null */
+  lastTickLost?: string | null;
+}
+
+/** 生成任务：提交后轮询到 done / failed，中途能看到阶段与上游状态 */
+export interface GenerateJob {
+  jobId: string;
+  fingerprint: string;
+  status: GenerateJobStatus;
+  phase: string;
+  final: boolean;
+  elapsedSec: number;
+  promptChars: number;
+  wantedClips: number;
+  clips: GenerateJobClip[];
+  clipCount: number;
+  progress: GenerateJobProgress;
+  /** 没建单（refetch / cache）时为 true */
+  reused: boolean;
+  taskId?: string;
+  source?: GenerateSource;
+  generateMs?: number;
+  detail?: string;
 }
 
 /**

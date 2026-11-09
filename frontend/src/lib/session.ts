@@ -5,14 +5,23 @@ import type { SectionKind, StitchResult, Take, TimelineSection } from "./types";
 /**
  * 会话快照：把「已花过钱的现场」留在本标签页的 sessionStorage 里。
  *
- * 只存**能安全还原**的东西：歌词、歌曲提示词、段落结构（含已被返回音频改写的自然时长）、
- * 提示词草稿、当前选中段、已锁定 Take、成品。已锁定 Take 与成品的音频地址都是后端 `/static`
- * 上的绝对地址，文件真在磁盘上，所以刷新后照样能播、能续拼；未锁定候选的地址是 `blob:`，
- * 只活在那一次页面进程里，存下来必然变死链 —— 这类地址一律不写进快照，读回来时也再校验一次。
+ * 存的是**能安全还原**的东西：歌词、歌曲提示词、段落结构（含已被返回音频改写的自然时长）、
+ * 提示词草稿、当前选中段、**每段的候选列表**、已锁定 Take、成品。生成改成任务式之后
+ * 候选与锁定一样都是后端 `/static` 上的绝对地址，文件真在磁盘上，所以刷新后照样能播、能续拼，
+ * 未锁定候选因此也值得写盘 —— 否则刷新后时间轴写着「已锁定 Take A」而下方卡片却是「暂无候选」。
+ * `blob:` 这类只活在上一次页面进程里的地址一律不写盘，读回来也再校验一次。
+ *
+ * 候选写盘是有界的：每段最多 `MAX_TAKES_PER_SECTION` 条，超出部分不进快照（文件仍在后端磁盘上，
+ * 账本也仍记着，只是这一份列表不再背它）。实测满配 12 段 × 24 条 = 49933 B（48.8 KB），
+ * 典型的「3 段 / 4 候选 / 1 锁定」现场只有 1680 B，离 sessionStorage 的 5 MB 配额很远。
  *
  * 磁盘上的文件不保证还在（清 `static/` 目录、换机器都会）：地址格式对 ≠ 文件在，所以恢复之后
  * 还要对每条 `/static` 地址探一次活（`HEAD`），404 的那条按「我们这边失败」处理 —— 从 `locked`
- * 里摘掉、成品直接作废，并以 error 级提示点名是哪几段，而不是留一个点开就报错的死链。
+ * 里摘掉、从候选列表里剔除、成品直接作废，并以 error 级提示点名是哪几段，
+ * 而不是留一个点开就报错的死链。
+ *
+ * 版本仍是 1：`takes` 是**新增可选字段**，旧快照没有它时读成 `{}`（再由锁定项兜出一条候选），
+ * 不因为加了一个字段就把用户已经花过钱的现场整份判废。
  */
 export const SESSION_STORAGE_KEY = "museblocks.session.v1";
 const SESSION_VERSION = 1;
@@ -21,6 +30,8 @@ const SESSION_VERSION = 1;
 const MAX_LYRICS_LEN = 20_000;
 const MAX_PROMPT_LEN = 4_000;
 const MAX_LABEL_LEN = 64;
+/** 每段候选写盘上限：4 个初始候选 + 若干轮续写（每轮 2 条）；超出只是不进快照，不删文件 */
+const MAX_TAKES_PER_SECTION = 24;
 
 export interface StoredSection {
   id: string;
@@ -60,6 +71,8 @@ export interface SessionSnapshot {
   lyrics: string;
   activeId: string;
   sections: StoredSection[];
+  /** 段 id → 候选列表（含已锁定那条，顺序即卡片顺序）；只收 `/static` 地址，每段有界 */
+  takes: Record<string, StoredTake[]>;
   /** 段 id → 已锁定 Take；只收 `/static` 地址 */
   locked: Record<string, StoredTake>;
   prompts: Record<string, string>;
@@ -128,6 +141,35 @@ function sanitizeTake(value: unknown): StoredTake | null {
     duration: Number.isFinite(duration) && duration > 0 && duration <= 600 ? duration : 0,
     clipId: clipId ?? null,
   };
+}
+
+/** `Take` → 可持久形态；锁定与候选共用同一份序列化，免得两处字段口径漂移 */
+function toStoredTake(take: Take): StoredTake {
+  return {
+    id: take.id,
+    label: take.label,
+    audioUrl: take.audioUrl,
+    duration: take.duration,
+    clipId: take.clipId ?? null,
+  };
+}
+
+/**
+ * 候选列表的写盘口径：只收 `/static`、按段封顶、id 去重。
+ * id 去重不是多余的 —— `key={take.id}` 与 `lockedTakeId === take.id` 都按 id 判同，
+ * 快照里塞进两条同 id 的候选会让 React 报重复 key，锁定一条还会连带把另一条标成已锁定。
+ */
+function sanitizeTakeList(value: unknown): StoredTake[] {
+  if (!Array.isArray(value)) return [];
+  const stored: StoredTake[] = [];
+  const seen = new Set<string>();
+  for (const item of value.slice(0, MAX_TAKES_PER_SECTION)) {
+    const take = sanitizeTake(item);
+    if (!take || seen.has(take.id)) continue;
+    seen.add(take.id);
+    stored.push(take);
+  }
+  return stored;
 }
 
 function asNumberArray(value: unknown, maxLen: number): number[] | null {
@@ -222,6 +264,18 @@ export function parseSession(raw: unknown): SessionSnapshot | null {
     if (sanitized) locked[sectionId] = sanitized;
   });
 
+  // 旧快照没有 takes 字段：读成 {}，由恢复侧用锁定项兜出一条候选，而不是整份判废
+  const takesSource =
+    value.takes && typeof value.takes === "object"
+      ? (value.takes as Record<string, unknown>)
+      : {};
+  const takes: Record<string, StoredTake[]> = {};
+  Object.entries(takesSource).forEach(([sectionId, list]) => {
+    if (!sectionIds.has(sectionId)) return;
+    const sanitized = sanitizeTakeList(list);
+    if (sanitized.length > 0) takes[sectionId] = sanitized;
+  });
+
   const promptsSource =
     value.prompts && typeof value.prompts === "object"
       ? (value.prompts as Record<string, unknown>)
@@ -246,6 +300,7 @@ export function parseSession(raw: unknown): SessionSnapshot | null {
     lyrics,
     activeId: storedActive && activeIds.has(storedActive) ? storedActive : sections[0].id,
     sections,
+    takes,
     locked,
     prompts,
     mix: sanitizeMix(value.mix),
@@ -260,6 +315,7 @@ export interface CaptureInput {
   lyrics: string;
   activeId: string;
   sections: TimelineSection[];
+  takes: Record<string, Take[] | undefined>;
   locked: Record<string, Take | undefined>;
   prompts: Record<string, string>;
   mix: StitchResult | null;
@@ -271,13 +327,24 @@ export function captureSession(input: CaptureInput): SessionSnapshot {
   // `blob:` 地址的锁定不写盘：那必然是死链，比缺失更糟（会被当成可拼接的段落）
   Object.entries(input.locked).forEach(([sectionId, take]) => {
     if (!take || !isPersistentAudioUrl(take.audioUrl)) return;
-    locked[sectionId] = {
-      id: take.id,
-      label: take.label,
-      audioUrl: take.audioUrl,
-      duration: take.duration,
-      clipId: take.clipId ?? null,
-    };
+    locked[sectionId] = toStoredTake(take);
+  });
+
+  // 候选与锁定同口径：只收 `/static`、每段封顶、id 去重。
+  // 已锁定那条通常也在候选列表里（卡片要靠它显示「已锁定」徽章），所以不去重掉它。
+  const sectionIds = new Set(input.sections.map((section) => section.id));
+  const takes: Record<string, StoredTake[]> = {};
+  Object.entries(input.takes).forEach(([sectionId, list]) => {
+    if (!sectionIds.has(sectionId) || !list) return;
+    const stored: StoredTake[] = [];
+    const seen = new Set<string>();
+    for (const take of list) {
+      if (stored.length >= MAX_TAKES_PER_SECTION) break;
+      if (!isPersistentAudioUrl(take.audioUrl) || seen.has(take.id)) continue;
+      seen.add(take.id);
+      stored.push(toStoredTake(take));
+    }
+    if (stored.length > 0) takes[sectionId] = stored;
   });
 
   const prompts: Record<string, string> = {};
@@ -302,6 +369,7 @@ export function captureSession(input: CaptureInput): SessionSnapshot {
       prompt: section.prompt,
       lyrics: section.lyrics,
     })),
+    takes,
     locked,
     prompts,
     // 成品随时可以免费重拼，但既然它在磁盘上就值得留下：省一次等待，也保住续写落点

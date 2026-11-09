@@ -4,7 +4,8 @@
 「单个 clip 内部的结构」—— 那是段边界信息完全看不到的部分。
 
 两条路互补：`POST /structure/boundaries` 用谱形状检测器（毫秒级定位、无语义），
-`GET /analyze_structure` 用深度学习结构模型（±0.1~0.5 s 定位、带 intro/verse/chorus 标签）。
+`GET /analyze_structure` 用深度学习结构模型（带 intro/verse/chorus 标签，但边界不能当裁切真值：
+2026-11-09 冷跑对全部 9 条真接缝取最近边界，误差中位数 1.624 s、最差 10.667 s，见 README §3.4）。
 
 后者是分钟级的活儿，所以同一份分析还提供任务式入口（`POST /structure/jobs` +
 `GET /structure/jobs/{job_id}`）：提交拿 job_id，轮询到终态，前端不必挂着一条长连接等。

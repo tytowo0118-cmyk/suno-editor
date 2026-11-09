@@ -1,8 +1,8 @@
-import { API_BASE } from "./api";
-import type { Take } from "./types";
+import { API_BASE, runGenerateJob } from "./api";
+import type { GenerateJob, GenerateSource, Take } from "./types";
 
-/** FastAPI 后端的 Suno 代理端点：只接收 prompt，返回整段 WAV */
-export const GENERATE_ENDPOINT = `${API_BASE}/api/generate`;
+/** FastAPI 后端的生成任务端点：提交拿 job_id，轮询读阶段进度（旧的同步 /api/generate 仍保留） */
+export const GENERATE_ENDPOINT = `${API_BASE}/api/generate/jobs`;
 
 /** 后端 `MAX_CLIPS_PER_TASK = 2`：一次任务上游固定产 2 条双生，同价，不取回才是白扔 */
 export const CLIPS_PER_TASK = 2;
@@ -26,152 +26,137 @@ interface GeneratedAudio {
   /** 本次音频对应的 Suno clip id，续写时需要回传给后端 */
   clipId: string | null;
   extras: ExtraClip[];
+  /** 计费来源：submit 真扣费 / refetch 免费重查 / cache 直接复用 */
+  source: GenerateSource;
 }
 
 interface GenerateRequest {
   prompt: string;
+  /** 占位：Suno 不吃时长参数，实际演唱时长由歌词决定，这里不再发给后端 */
   durationSec: number;
   signal?: AbortSignal;
   continueClipId?: string;
   continueAt?: number;
   /** 一次任务上游固定产出 2 个片段，>1 时把多出来的那些一并取回 */
   maxClips?: number;
+  onProgress?: (job: GenerateJob) => void;
 }
 
-function readDuration(blobUrl: string): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const audio = new Audio();
-    audio.preload = "metadata";
-    audio.src = blobUrl;
-    audio.onloadedmetadata = () => {
-      if (Number.isFinite(audio.duration) && audio.duration > 0) {
-        resolve(audio.duration);
-      } else {
-        reject(new Error("无法解析生成音频的时长"));
-      }
-    };
-    audio.onerror = () => reject(new Error("生成的音频无法解码，请检查返回格式"));
-  });
-}
-
-function isWav(bytes: Uint8Array): boolean {
-  if (bytes.length < 12) return false;
-  const tag = (start: number) => String.fromCharCode(...bytes.slice(start, start + 4));
-  return tag(0) === "RIFF" && tag(8) === "WAVE";
-}
-
-function extractDetail(text: string): string {
-  const trimmed = text.trim();
-  if (!trimmed) return "";
-  try {
-    const parsed: unknown = JSON.parse(trimmed);
-    if (parsed && typeof parsed === "object" && "detail" in parsed) {
-      return String((parsed as { detail: unknown }).detail).slice(0, 160);
-    }
-  } catch {
-    // 非 JSON 错误体直接截断展示
-  }
-  return trimmed.slice(0, 160);
-}
-
-/** 后端把双生片段列表 base64 放在 X-Suno-Extra-Clips 里（纯 ASCII JSON，可直接 atob） */
-function readExtraClips(response: Response): ExtraClip[] {
-  const raw = response.headers.get("x-suno-extra-clips")?.trim();
-  if (!raw) return [];
-  try {
-    const parsed: unknown = JSON.parse(atob(raw));
-    if (!Array.isArray(parsed)) return [];
-    return parsed.flatMap((item) => {
-      if (!item || typeof item !== "object") return [];
-      const record = item as { clipId?: unknown; url?: unknown; duration?: unknown };
-      if (typeof record.url !== "string" || !record.url) return [];
-      return [
-        {
-          clipId: typeof record.clipId === "string" ? record.clipId : null,
-          url: record.url,
-          duration: typeof record.duration === "number" ? record.duration : 0,
-        },
-      ];
-    });
-  } catch {
-    return [];
-  }
-}
-
-async function fetchExtraAudio(extra: ExtraClip, signal?: AbortSignal): Promise<GeneratedAudio> {
-  const response = await fetch(extra.url, { signal, cache: "no-store" });
-  if (!response.ok) {
-    throw new Error(`双生片段下载失败（HTTP ${response.status}）`);
-  }
-  const blob = await response.blob();
-  const header = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
-  if (!isWav(header)) {
-    throw new Error("双生片段不是 WAV 音频");
-  }
-  const url = URL.createObjectURL(blob);
-  const duration =
-    Number.isFinite(extra.duration) && extra.duration > 0 ? extra.duration : await readDuration(url);
-  return { url, duration, clipId: extra.clipId, extras: [] };
-}
-
-async function generateOne(input: GenerateRequest): Promise<GeneratedAudio> {
-  const form = new FormData();
-  // 结构标签与歌词已在调用方拼进 prompt
-  form.append("prompt", input.prompt);
-  // 占位字段：后端按歌词自行决定演唱时长，不再强依赖该值
-  form.append("duration", String(Math.max(1, Math.round(input.durationSec))));
-  if (input.continueClipId) {
-    form.append("continue_clip_id", input.continueClipId);
-    form.append("continue_at", Math.max(0, input.continueAt ?? 0).toFixed(3));
-  }
-  if (input.maxClips && input.maxClips > 1) {
-    form.append("max_clips", String(input.maxClips));
-  }
-
-  let response: Response;
-  try {
-    response = await fetch(GENERATE_ENDPOINT, {
-      method: "POST",
-      body: form,
-      signal: input.signal,
-      cache: "no-store",
-    });
-  } catch (error) {
-    if (input.signal?.aborted) throw error;
-    throw new Error(
-      `无法连接生成服务（${GENERATE_ENDPOINT}）：请确认 FastAPI 后端与 Suno 代理已启动`,
-    );
-  }
-
-  if (!response.ok) {
-    const detail = extractDetail(await response.text().catch(() => ""));
-    throw new Error(`生成失败（HTTP ${response.status}）${detail ? `：${detail}` : ""}`);
-  }
-
-  const contentType = response.headers.get("content-type") ?? "未知";
-  const clipId = response.headers.get("x-suno-clip-id")?.trim() || null;
-  const extras = readExtraClips(response);
-  const blob = await response.blob();
-  const header = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
-  if (!isWav(header)) {
-    throw new Error(`生成服务返回的不是 WAV 音频（Content-Type: ${contentType}）`);
-  }
-
-  const url = URL.createObjectURL(blob);
-  try {
-    const duration = await readDuration(url);
-    return { url, duration, clipId, extras };
-  } catch (error) {
-    URL.revokeObjectURL(url);
-    throw error;
-  }
+/** 后端回的是 /static/output/... 相对地址，补上 API_BASE 才是浏览器能播的绝对地址 */
+function absoluteAudio(url: string): string {
+  return url.startsWith("http") ? url : `${API_BASE}${url}`;
 }
 
 /**
- * 生成一组候选：并发请求 `count` 次任务，每次任务的上游固定产 2 条双生片段，
- * 主片段与 `extras` 全部挂载成候选 —— 第 2 条同样已扣费，扔掉它等于白付一半钱。
- * 任一任务失败则回收已生成的 Blob URL 并抛错，避免内存泄漏；
- * 只是某条双生取不回来时保留已挂载的候选，不作废整次生成。
+ * 提交一次生成任务并轮询到终态。
+ *
+ * 与改造前最大的不同：候选不再落成浏览器 Blob，而是直接引用后端已落盘的 WAV。
+ * 于是刷新后候选还在（配合会话快照），双生第二条也不必再下载一遍，
+ * 而「这次有没有花钱」由 job.source 如实给出，不靠耗时去猜。
+ */
+async function generateOne(input: GenerateRequest): Promise<GeneratedAudio> {
+  const job = await runGenerateJob(
+    {
+      prompt: input.prompt,
+      continueClipId: input.continueClipId,
+      continueAt: input.continueAt,
+      maxClips: input.maxClips ?? CLIPS_PER_TASK,
+    },
+    {
+      onJob: input.onProgress,
+      // 取消只是不再等：服务端任务可能已经扣费，它会继续跑完并把结果记进账本
+      isCancelled: () => Boolean(input.signal?.aborted),
+    },
+  );
+
+  if (!job) {
+    throw new Error("已停止等待；任务仍在服务端跑，结果会留在账本里，下次同样内容直接复用");
+  }
+  if (job.status === "failed" || job.clips.length === 0) {
+    const detail = job.detail ?? "生成失败";
+    // 有 task_id 就说明建单成功、钱已经花了；账本记着它，重试是免费重查。
+    // 但后端超时的 detail 自带「任务已扣费且已记账」那句，再补一遍就是同一句安慰说两遍
+    // （实测浮层读作「…免费重查这张票据；已扣费并记账，重试不会再次计费」），
+    // 所以只在 detail 没提记账时补 —— 下载失败之类的 detail 只讲传输，不讲钱。
+    const needsBillingNote = Boolean(job.taskId) && !detail.includes("记账");
+    throw new Error(needsBillingNote ? `${detail}；已扣费并记账，重试不会再次计费` : detail);
+  }
+
+  const [first, ...rest] = job.clips;
+  return {
+    url: absoluteAudio(first.audioUrl),
+    duration: first.duration,
+    clipId: first.clipId,
+    extras: rest.map((clip) => ({
+      clipId: clip.clipId,
+      url: absoluteAudio(clip.audioUrl),
+      duration: clip.duration,
+    })),
+    source: job.source ?? "submit",
+  };
+}
+
+/** 本次生成有没有再花钱，用于候选挂载后的提示；措辞与后端 source 一一对应 */
+export function billingNote(sources: GenerateSource[]): string | null {
+  if (sources.length === 0) return null;
+  if (sources.every((source) => source === "cache")) {
+    return "复用已落盘结果，未再次计费";
+  }
+  if (sources.every((source) => source !== "submit")) {
+    return "重查已扣费任务取回结果，未再次计费";
+  }
+  const charged = sources.filter((source) => source === "submit").length;
+  const free = sources.length - charged;
+  return free > 0
+    ? `本次建单 ${charged} 次，另 ${free} 次复用已扣费结果`
+    : `本次建单 ${charged} 次（已扣费）`;
+}
+
+const PHASE_LABEL: Record<string, string> = {
+  queued: "排队中",
+  submitting: "提交建单",
+  generating: "上游生成中",
+  downloading: "下载片段",
+  transcoding: "转码 WAV",
+  done: "已落盘",
+  failed: "失败",
+};
+
+/** 把任务状态翻成一行可读进度，计费语义单独给出，避免「等得久＝又花钱了」的误解 */
+export function describeGenerateJob(job: GenerateJob): {
+  label: string;
+  billing: string | null;
+  failed: boolean;
+} {
+  const phase = PHASE_LABEL[job.phase] ?? job.phase;
+  const parts = [phase];
+  if (job.phase === "generating") {
+    if (job.progress.upstreamStatus) parts.push(`上游 ${job.progress.upstreamStatus}`);
+    if (job.progress.pollTicks) parts.push(`第 ${job.progress.pollTicks} 拍`);
+  }
+  if ((job.phase === "downloading" || job.phase === "transcoding") && job.progress.clipTotal) {
+    parts.push(`${(job.progress.clipIndex ?? 0) + 1}/${job.progress.clipTotal}`);
+  }
+  if (!job.final) parts.push(`${job.elapsedSec.toFixed(1)}s`);
+  if (job.progress.lostTicks) {
+    parts.push(`丢 ${job.progress.lostTicks} 拍（代理抖动，任务未判死）`);
+  }
+  const billing =
+    job.source === "cache"
+      ? "复用已落盘结果，未再次计费"
+      : job.source === "refetch"
+        ? "重查已扣费任务，未再次计费"
+        : job.source === "submit" && job.final && job.status === "done"
+          ? "本次建单已扣费"
+          : null;
+  return { label: parts.join(" · "), billing, failed: job.status === "failed" };
+}
+
+/**
+ * 生成一组候选：并发提交 `count` 个任务，每个任务上游固定产 2 条双生片段，
+ * 主片段与 extras 全部挂载成候选 —— 第 2 条同样已扣费，扔掉它等于白付一半钱。
+ * 片段地址都是后端 /static 上的 WAV，不需要再下载或建 Blob。
+ * 任一任务失败则抛错；已扣费的结果留在后端账本里，重试同指纹不会再次计费。
  */
 export async function generateTakes(input: {
   sectionId: string;
@@ -179,16 +164,20 @@ export async function generateTakes(input: {
   durationSec: number;
   count?: number;
   signal?: AbortSignal;
-}): Promise<Take[]> {
+  onProgress?: (job: GenerateJob, taskIndex: number) => void;
+}): Promise<{ takes: Take[]; sources: GenerateSource[] }> {
   const count = input.count ?? TASKS_PER_SECTION;
   const durationSec = Math.max(1, Math.round(input.durationSec));
   const settled = await Promise.allSettled(
-    Array.from({ length: count }, () =>
+    Array.from({ length: count }, (_, taskIndex) =>
       generateOne({
         prompt: input.prompt,
         durationSec,
         signal: input.signal,
         maxClips: CLIPS_PER_TASK,
+        onProgress: input.onProgress
+          ? (job) => input.onProgress?.(job, taskIndex)
+          : undefined,
       }),
     ),
   );
@@ -200,7 +189,6 @@ export async function generateTakes(input: {
     (item): item is PromiseRejectedResult => item.status === "rejected",
   );
   if (failure) {
-    generated.forEach((audio) => URL.revokeObjectURL(audio.url));
     throw failure.reason instanceof Error ? failure.reason : new Error("生成失败");
   }
 
@@ -222,27 +210,17 @@ export async function generateTakes(input: {
   for (const audio of generated) {
     pushTake(audio.url, audio.duration, audio.clipId);
     for (const extra of audio.extras) {
-      try {
-        const downloaded = await fetchExtraAudio(extra, input.signal);
-        pushTake(downloaded.url, downloaded.duration, downloaded.clipId);
-      } catch (error) {
-        if (input.signal?.aborted) {
-          revokeTakeAudio(takes);
-          throw error;
-        }
-        // 双生取不回来只是少一个候选，主片段已经扣过费且已经挂在上面了
-      }
+      pushTake(extra.url, extra.duration, extra.clipId);
     }
   }
 
-  return takes;
+  return { takes, sources: generated.map((audio) => audio.source) };
 }
 
 /**
  * 从某个 clip 的指定秒数续写：上游把 continueAt 之前的音频当作创作上下文，
  * 返回在其后新生成的音频（实测不含原开头），因此结果适合作为该段的额外候选试听。
- * 一次任务上游固定产出 2 个片段（双生），这里全部下载并挂载为独立候选，
- * 免得已扣费的另一半被丢掉。
+ * 一次任务上游固定产出 2 个片段（双生），这里全部挂载为独立候选，免得已扣费的另一半被丢掉。
  */
 export async function continueTakes(input: {
   sectionId: string;
@@ -251,14 +229,16 @@ export async function continueTakes(input: {
   prompt: string;
   durationSec: number;
   signal?: AbortSignal;
-}): Promise<Take[]> {
+  onProgress?: (job: GenerateJob) => void;
+}): Promise<{ takes: Take[]; source: GenerateSource }> {
   const audio = await generateOne({
     prompt: input.prompt,
     durationSec: input.durationSec,
     signal: input.signal,
     continueClipId: input.clipId,
     continueAt: input.continueAt,
-    maxClips: 2,
+    maxClips: CLIPS_PER_TASK,
+    onProgress: input.onProgress,
   });
 
   const stamp = Date.now().toString(36);
@@ -273,26 +253,17 @@ export async function continueTakes(input: {
     },
   ];
 
-  for (const extra of audio.extras) {
-    try {
-      const downloaded = await fetchExtraAudio(extra, input.signal);
-      takes.push({
-        id: `${input.sectionId}-continue-${stamp}-${takes.length}`,
-        label: label(takes.length),
-        audioUrl: downloaded.url,
-        duration: downloaded.duration,
-        clipId: downloaded.clipId,
-      });
-    } catch (error) {
-      if (input.signal?.aborted) {
-        revokeTakeAudio(takes);
-        throw error;
-      }
-      // 残值片段取不回来不该作废整次续写，保留已经挂载的候选
-    }
-  }
+  audio.extras.forEach((extra) => {
+    takes.push({
+      id: `${input.sectionId}-continue-${stamp}-${takes.length}`,
+      label: label(takes.length),
+      audioUrl: extra.url,
+      duration: extra.duration,
+      clipId: extra.clipId,
+    });
+  });
 
-  return takes;
+  return { takes, source: audio.source };
 }
 
 export function revokeTakeAudio(takes: Take[] | undefined): void {

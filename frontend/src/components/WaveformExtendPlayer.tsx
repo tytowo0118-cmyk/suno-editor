@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { clipIdFromAudioUrl, fetchStructureBoundaries, runStructureJob } from "@/lib/api";
 import { sectionTag } from "@/lib/lyrics";
-import { continueTakes } from "@/lib/musicgen";
+import { continueTakes, describeGenerateJob } from "@/lib/musicgen";
 import {
   formatClock,
   locateMixSegment,
@@ -12,6 +12,7 @@ import {
   segmentLabelCn,
 } from "@/lib/sections";
 import type {
+  GenerateJob,
   NoticeLevel,
   StitchResult,
   StructureCandidate,
@@ -63,6 +64,7 @@ export default function WaveformExtendPlayer({
   const [snapped, setSnapped] = useState<{ fromSec: number; toSec: number } | null>(null);
   const [dlSegments, setDlSegments] = useState<StructureSegment[]>([]);
   const [dlJob, setDlJob] = useState<StructureJob | null>(null);
+  const [extendJob, setExtendJob] = useState<GenerateJob | null>(null);
 
   // 结构候选是成品自身的属性；Studio 用 mix.filename 作 key 重挂本组件，所以换成品会自然清空。
   // 分析失败只是没有吸附，不影响试听与续写。
@@ -176,13 +178,15 @@ export default function WaveformExtendPlayer({
 
     pauseAllAudio();
     setBusy(true);
+    setExtendJob(null);
     try {
-      const extended = await continueTakes({
+      const { takes: extended, source } = await continueTakes({
         sectionId: targetSection.id,
         clipId: targetTake.clipId,
         continueAt: target.offsetSec,
         prompt,
         durationSec: targetTake.duration,
+        onProgress: setExtendJob,
       });
       // 上游返回的是「以点击点为上下文新生成」的音频，不替换锁定，只作为该段额外候选
       onTakes(targetSection.id, extended);
@@ -190,7 +194,8 @@ export default function WaveformExtendPlayer({
       onNotice(
         `已按续写点生成「${targetSection.title}」的 ${extended.length} 个新候选（${extended
           .map((item) => `${item.duration.toFixed(1)}s`)
-          .join(" / ")}），试听后再决定是否锁定`,
+          .join(" / ")}），试听后再决定是否锁定` +
+          (source === "submit" ? "" : "；复用已扣费结果，未再次计费"),
       );
     } catch (error) {
       onNotice(error instanceof Error ? `续写失败：${error.message}` : "续写失败", "error");
@@ -198,6 +203,8 @@ export default function WaveformExtendPlayer({
       setBusy(false);
     }
   };
+
+  const extendStatus = extendJob ? describeGenerateJob(extendJob) : null;
 
   return (
     <>
@@ -264,8 +271,9 @@ export default function WaveformExtendPlayer({
           点击成品波形选择续写点，后端把全曲时间换算回该段 Suno clip 的段内秒数，以
           <span className="font-mono text-zinc-300"> continue_at </span>
           请求续写：该点之前的音频作为上下文，其后重新生成，结果作为该段的新候选追加在下方，
-          试听满意再锁定。白色刻度是谱形状检测候选（毫秒定位），蓝色是模型段边界（±0.1~0.5 s，
-          但能看到检测器漏掉的接缝）；色带是模型读出的段落语义，只帮判断，不参与时间换算。
+          试听满意再锁定。白色刻度是谱形状检测候选（毫秒定位），蓝色是模型段边界（实测对真接缝
+          的最近边界误差中位数 1.6 s，只作吸附参考、不作裁切真值，但能看到检测器漏掉的接缝）；
+          色带是模型读出的段落语义，只帮判断，不参与时间换算。
         </p>
         {point != null && (
           <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -297,6 +305,16 @@ export default function WaveformExtendPlayer({
               {busy ? "续写中" : "从此处续写"}
             </button>
           </div>
+        )}
+        {extendStatus && (
+          <p
+            className={`mt-2 font-mono text-[10px] ${
+              extendStatus.failed ? "text-rose-300/90" : "text-zinc-500"
+            }`}
+          >
+            续写任务 · {extendStatus.label}
+            {extendStatus.billing ? ` · ${extendStatus.billing}` : ""}
+          </p>
         )}
         {point != null && !canExtend && !busy && (
           <p className="mt-2 text-[10px] text-amber-300/80">

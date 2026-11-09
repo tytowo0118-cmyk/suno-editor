@@ -1,4 +1,7 @@
 import type {
+  GenerateJob,
+  GenerateJobStatus,
+  GenerateSource,
   StitchResult,
   StructureCandidate,
   StructureJob,
@@ -217,51 +220,215 @@ export interface RunStructureJobOptions {
   isCancelled?: () => boolean;
 }
 
+interface PollableJob {
+  jobId: string;
+  final: boolean;
+}
+
+interface PollOptions<T extends PollableJob> {
+  intervalMs: number;
+  isCancelled: () => boolean;
+  onJob?: (job: T) => void;
+  fetchJob: (jobId: string) => Promise<T | null>;
+  resubmit: () => Promise<T>;
+  lostError: (jobId: string) => string;
+  logLabel: string;
+}
+
 /**
- * 提交并轮询一次深度学习结构分析，直到终态（done / failed）。
+ * 任务式接口的共用轮询循环（结构分析与生成各有一套任务表，契约相同）。
  *
- * 整曲推理在 8 核 CPU 上是分钟级，所以不是一条挂着的请求，而是提交 + 轮询：
  * 期间任何一次轮询失败只当作「这一拍没问到」，由下一次轮询补上；
- * 只有后端明确 404（任务表随重启丢失）才重新提交，且最多补提交一次。
+ * 只有后端明确 404（任务表随重启丢失）才重新提交，且最多补提交一次 ——
+ * 反复 404 说明在跟重启互相追，别把轮询挂成永续。
+ *
+ * 生成任务重提交是安全的：后端账本记着已扣费的 task_id，同指纹只会免费重查，不会再建单。
  */
-export async function runStructureJob(
-  clipId: string,
-  options: RunStructureJobOptions = {},
-): Promise<StructureJob | null> {
-  const intervalMs = options.intervalMs ?? 3000;
-  const cancelled = options.isCancelled ?? (() => false);
-  let job = toJob(await requestJson<RawStructureJob>("/api/structure/jobs", {
-    method: "POST",
-    body: JSON.stringify({ clip_id: clipId }),
-  }));
+async function pollUntilFinal<T extends PollableJob>(
+  first: T,
+  options: PollOptions<T>,
+): Promise<T | null> {
+  let job = first;
   options.onJob?.(job);
   let resubmitted = false;
 
-  while (!job.final && !cancelled()) {
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-    if (cancelled()) break;
-    let next: StructureJob | null;
+  while (!job.final && !options.isCancelled()) {
+    await new Promise((resolve) => setTimeout(resolve, options.intervalMs));
+    if (options.isCancelled()) break;
+    let next: T | null;
     try {
-      next = await fetchJob(job.jobId);
+      next = await options.fetchJob(job.jobId);
     } catch (error) {
       // 轮询这一拍失败（代理抖一下）不致命，下一拍接着问。
-      console.error("结构分析轮询失败，下一拍重试:", error);
+      console.error(`${options.logLabel}轮询失败，下一拍重试:`, error);
       continue;
     }
     if (next) {
       job = next;
     } else if (!resubmitted) {
       resubmitted = true;
-      job = toJob(await requestJson<RawStructureJob>("/api/structure/jobs", {
-        method: "POST",
-        body: JSON.stringify({ clip_id: clipId }),
-      }));
+      job = await options.resubmit();
     } else {
-      // 一次 404 当作后端重启，重提一次就够；反复 404 说明在跟重启互相追，别把轮询挂成永续。
-      throw new Error(`分析任务反复丢失（后端可能在反复重启）：${job.jobId}`);
+      throw new Error(options.lostError(job.jobId));
     }
     options.onJob?.(job);
   }
 
-  return cancelled() ? null : job;
+  return options.isCancelled() ? null : job;
+}
+
+/**
+ * 提交并轮询一次深度学习结构分析，直到终态（done / failed）。
+ * 整曲推理在 8 核 CPU 上是分钟级，所以不是一条挂着的请求，而是提交 + 轮询。
+ */
+export async function runStructureJob(
+  clipId: string,
+  options: RunStructureJobOptions = {},
+): Promise<StructureJob | null> {
+  const submit = () =>
+    requestJson<RawStructureJob>("/api/structure/jobs", {
+      method: "POST",
+      body: JSON.stringify({ clip_id: clipId }),
+    }).then(toJob);
+
+  return pollUntilFinal(await submit(), {
+    intervalMs: options.intervalMs ?? 3000,
+    isCancelled: options.isCancelled ?? (() => false),
+    onJob: options.onJob,
+    fetchJob,
+    resubmit: submit,
+    lostError: (jobId) => `分析任务反复丢失（后端可能在反复重启）：${jobId}`,
+    logLabel: "结构分析",
+  });
+}
+
+interface RawGenerateJobClip {
+  clip_id: string | null;
+  filename: string;
+  duration: number;
+  audio_url: string;
+}
+
+interface RawGenerateJob {
+  job_id: string;
+  fingerprint: string;
+  status: GenerateJobStatus;
+  phase: string;
+  final: boolean;
+  elapsed_sec: number;
+  prompt_chars: number;
+  wanted_clips: number;
+  clips: RawGenerateJobClip[];
+  clip_count: number;
+  progress: {
+    upstream_status?: string;
+    poll_ticks?: number;
+    lost_ticks?: number;
+    ready_clips?: number;
+    clip_index?: number;
+    clip_total?: number;
+    clip_reused?: boolean;
+    last_tick_lost?: string | null;
+  };
+  reused: boolean;
+  task_id?: string;
+  source?: GenerateSource;
+  generate_ms?: number;
+  detail?: string;
+}
+
+function toGenerateJob(data: RawGenerateJob): GenerateJob {
+  return {
+    jobId: data.job_id,
+    fingerprint: data.fingerprint,
+    status: data.status,
+    phase: data.phase,
+    final: data.final,
+    elapsedSec: data.elapsed_sec,
+    promptChars: data.prompt_chars,
+    wantedClips: data.wanted_clips,
+    clips: (data.clips ?? []).map((clip) => ({
+      clipId: clip.clip_id,
+      filename: clip.filename,
+      duration: clip.duration,
+      audioUrl: clip.audio_url,
+    })),
+    clipCount: data.clip_count,
+    progress: {
+      upstreamStatus: data.progress?.upstream_status,
+      pollTicks: data.progress?.poll_ticks,
+      lostTicks: data.progress?.lost_ticks,
+      readyClips: data.progress?.ready_clips,
+      clipIndex: data.progress?.clip_index,
+      clipTotal: data.progress?.clip_total,
+      clipReused: data.progress?.clip_reused,
+      lastTickLost: data.progress?.last_tick_lost ?? null,
+    },
+    reused: data.reused,
+    taskId: data.task_id,
+    source: data.source,
+    generateMs: data.generate_ms,
+    detail: data.detail,
+  };
+}
+
+async function fetchGenerateJob(jobId: string): Promise<GenerateJob | null> {
+  const response = await fetch(
+    `${API_BASE}/api/generate/jobs/${encodeURIComponent(jobId)}`,
+    { cache: "no-store" },
+  );
+  // 404 = 后端重启把内存任务表清了；账本没丢，重新提交同指纹会免费重查，不会再扣费
+  if (response.status === 404) return null;
+  if (!response.ok) {
+    throw new Error(extractError(await response.json().catch(() => null), response.status));
+  }
+  return toGenerateJob((await response.json()) as RawGenerateJob);
+}
+
+export interface RunGenerateJobOptions {
+  /** 每次状态变化都回调，UI 据此显示阶段、上游状态与已耗时 */
+  onJob?: (job: GenerateJob) => void;
+  intervalMs?: number;
+  /** 只停止等待，不取消服务端任务：钱可能已经花了，结果会留在账本里下次直接复用 */
+  isCancelled?: () => boolean;
+}
+
+/**
+ * 提交并轮询一次 Suno 生成，直到终态（done / failed）。
+ *
+ * 与结构分析同一套契约，但这里轮询的是**已经扣费**的任务：
+ * 单次轮询失败不判死，404 重提交也不会再花钱（后端按载荷指纹免费重查）。
+ * 取消只是不再等，服务端会把片段落盘并记账。
+ */
+export async function runGenerateJob(
+  input: {
+    prompt: string;
+    continueClipId?: string;
+    continueAt?: number;
+    maxClips?: number;
+  },
+  options: RunGenerateJobOptions = {},
+): Promise<GenerateJob | null> {
+  const body = JSON.stringify({
+    prompt: input.prompt,
+    ...(input.continueClipId
+      ? {
+          continue_clip_id: input.continueClipId,
+          continue_at: Math.max(0, input.continueAt ?? 0),
+        }
+      : {}),
+    ...(input.maxClips ? { max_clips: input.maxClips } : {}),
+  });
+  const submit = () =>
+    requestJson<RawGenerateJob>("/api/generate/jobs", { method: "POST", body }).then(toGenerateJob);
+
+  return pollUntilFinal(await submit(), {
+    intervalMs: options.intervalMs ?? 2000,
+    isCancelled: options.isCancelled ?? (() => false),
+    onJob: options.onJob,
+    fetchJob: fetchGenerateJob,
+    resubmit: submit,
+    lostError: (jobId) => `生成任务反复丢失（后端可能在反复重启）：${jobId}`,
+    logLabel: "生成任务",
+  });
 }

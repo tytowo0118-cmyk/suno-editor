@@ -6,6 +6,14 @@
 2. 每 5 秒轮询 `/suno/fetch/{task_id}`，直到任务完成；
 3. 下载远端音频，用 ffmpeg 统一转成 44.1 kHz 立体声 WAV 后返回二进制流。
 
+**提交是扣费操作，所以主链路 `run_generation` 一拿到 task_id 就把它按载荷指纹写进落盘账本**
+（`utils/generate_cache.py`）。同指纹的后续请求 —— 重试、刷新、后端重启 —— 先免费重查那张票据，
+而不是再建一单；只有上游明确判死才允许再次付费。同步端点与任务端点共用这一个函数。
+
+两条入口：`POST /api/generate` 一条请求挂到底（兼容旧调用），
+`POST /api/generate/jobs` + `GET /api/generate/jobs/{job_id}` 提交加轮询、带阶段进度
+（submitting / generating / downloading / transcoding），见 `api/generate_jobs.py`。
+
 附带 `continue_clip_id` / `continue_at` 时走续写：上游把该 clip 在 `continue_at` 秒之前的音频
 当作创作上下文，返回一段以此为基础**重新生成**的续写音频（实测并不包含原开头，因此它是一版
 新候选而不是延长版）；响应头 `X-Suno-Clip-Id` 回传本次音频的 clip id，可继续作为下一次续写的源。
@@ -28,15 +36,17 @@ import time
 import urllib.parse
 import uuid
 import wave
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import FileResponse
 
-from utils import clip_index
+from utils import clip_index, generate_cache
 from utils.audio_processor import STATIC_DIR
+from utils.generate_cache import ClipRef
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +73,26 @@ class PollTickLost(Exception):
     9.9 s 的阶梯必被击穿。任务已经建单扣费，所以「问不到」只该让这一次 tick 作废，
     由 `_wait_for_audio` 睡到下一个轮询间隔继续问，直到 `SUNO_TIMEOUT` 总预算才算超时。
     """
+
+
+class UpstreamTaskFailed(HTTPException):
+    """上游把这条已扣费的任务判成终态且不可能再出音频。
+
+    只有这一类失败才允许把账本写成 `failed`（= 允许再次付费提交）：任务 FAILED，
+    或者任务 COMPLETE 却一个音频地址都没给。本地超时、下载失败、进程重启都不属于此列，
+    那些票据留在 `submitted`，下次同指纹的请求免费重查。
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(status_code=502, detail=detail)
+
+
+# 进度回调只收「增量字段」，由任务表合并进 job.progress；同步端点不传，行为与改造前一致。
+ProgressHook = Callable[[dict[str, Any]], None]
+
+
+def _noop_progress(_update: dict[str, Any]) -> None:
+    return None
 
 
 def _log_upstream(label: str, response: httpx.Response) -> None:
@@ -369,14 +399,17 @@ async def _post_submit(
     raise HTTPException(status_code=502, detail="无法连接 Suno 代理：提交未产生响应")
 
 
-async def _submit(
-    client: httpx.AsyncClient,
-    base: str,
-    headers: dict[str, str],
+def build_payload(
     prompt: str,
     continue_clip_id: Optional[str] = None,
     continue_at: Optional[float] = None,
-) -> str:
+) -> dict[str, Any]:
+    """把浏览器的 prompt 掰成上游实际载荷。**纯函数、不建单、不花钱**。
+
+    单独抽出来是为了让扣费指纹算在「上游真正收到的东西」上：`_prepare_vocal_payload` 会重写
+    tags 与歌词头，两个不同的 raw prompt 可能掰成同一份载荷，那本来就是同一次创作，
+    应该命中同一条账本；反过来 `mv` 或续写字段变了必须是新键。
+    """
     tags, lyrics, instrumental = _split_prompt(prompt)
     if not instrumental:
         # 全曲生成与截断续写都走这里，续写同样容易被上游判成纯器乐
@@ -387,13 +420,6 @@ async def _submit(
         "make_instrumental": instrumental,
         "wait_audio": False,
     }
-    logger.info(
-        "suno payload prepared: instrumental=%s continue=%s tags=%r prompt_head=%r",
-        instrumental,
-        continue_clip_id or "-",
-        payload["tags"],
-        payload["prompt"][:32],
-    )
     mv = os.environ.get("SUNO_MODEL", "").strip()
     if mv:
         payload["mv"] = mv
@@ -403,12 +429,28 @@ async def _submit(
         if continue_at is not None:
             payload["continue_at"] = round(continue_at, 3)
 
+    logger.info(
+        "suno payload prepared: instrumental=%s continue=%s tags=%r prompt_head=%r",
+        instrumental,
+        continue_clip_id or "-",
+        payload["tags"],
+        payload["prompt"][:32],
+    )
     if VERBOSE_LOG:
         logger.info(
             "suno submit payload: %s",
             json.dumps(payload, ensure_ascii=False, sort_keys=True),
         )
+    return payload
 
+
+async def _submit(
+    client: httpx.AsyncClient,
+    base: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+) -> str:
+    """建单（扣费）。载荷由 `build_payload` 先算好，指纹才能在提交前就确定。"""
     response = await _post_submit(client, base, headers, payload)
 
     _log_upstream("submit", response)
@@ -506,30 +548,37 @@ async def _wait_for_audio(
     headers: dict[str, str],
     task_id: str,
     max_clips: int = 1,
+    on_tick: Optional[ProgressHook] = None,
 ) -> list[dict[str, Any]]:
     """轮询直到至少有一个片段落定，返回最多 max_clips 条 {clip_id, audio_url}。
 
     单次查询交给 `_poll_once` 做退避重试；重试预算耗尽只作废当前 tick，继续按
     `SUNO_POLL_INTERVAL` 问到 `SUNO_TIMEOUT` 为止 —— 任务已经建单扣费，
     不能因为代理掐了十几秒 TLS 就判死（实测见 README §2.3）。
+
+    `on_tick` 每拍到一次状态就回调（含作废的 tick），让任务表能显示
+    「上游还在 TEXT / 已问到第几拍 / 丢了几拍」，而不是只有一个转圈。
     """
     interval = max(0.05, _env_float("SUNO_POLL_INTERVAL", 5.0))
     timeout = max(10, _env_int("SUNO_TIMEOUT", 300))
     deadline = time.monotonic() + timeout
     url = f"{base}/suno/fetch/{urllib.parse.quote(task_id, safe='')}"
     lost_ticks = 0
+    poll_ticks = 0
+    emit = on_tick or _noop_progress
 
     while True:
         try:
             response = await _poll_once(client, url, headers, task_id, deadline)
         except PollTickLost as lost:
             lost_ticks += 1
+            emit({"poll_ticks": poll_ticks, "lost_ticks": lost_ticks, "last_tick_lost": str(lost)[:160]})
             if time.monotonic() >= deadline:
                 raise HTTPException(
                     status_code=504,
                     detail=(
                         f"Suno 轮询在 {timeout}s 内问不到状态（task_id={task_id}，"
-                        f"作废 {lost_ticks} 次）：{lost}；任务已扣费，可用该 task_id 免费重查"
+                        f"作废 {lost_ticks} 次）：{lost}；任务已扣费且已记账，重试会免费重查这张票据"
                     ),
                 ) from lost
             logger.warning(
@@ -543,6 +592,7 @@ async def _wait_for_audio(
             await asyncio.sleep(interval)
             continue
 
+        poll_ticks += 1
         # 落到这里说明是 2xx 或不可重试的 4xx（401 / 404 之类，重试也救不回来）
         if response.status_code >= 400:
             detail = _upstream_message(response.text) or f"HTTP {response.status_code}"
@@ -557,23 +607,29 @@ async def _wait_for_audio(
             body = None
 
         status, clips, message = _fetch_state(body)
+        emit(
+            {
+                "upstream_status": status,
+                "poll_ticks": poll_ticks,
+                "lost_ticks": lost_ticks,
+                "ready_clips": len(clips),
+                "last_tick_lost": None,
+            }
+        )
         if status in FAILED_STATES:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Suno 生成失败（task_id={task_id}）：{message or status}",
-            )
+            raise UpstreamTaskFailed(f"Suno 生成失败（task_id={task_id}）：{message or status}")
         if clips:
             return clips[:max_clips]
         if status in COMPLETE_STATES:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Suno 任务已完成但没有返回音频地址：task_id={task_id}",
-            )
+            raise UpstreamTaskFailed(f"Suno 任务已完成但没有返回音频地址：task_id={task_id}")
 
         if time.monotonic() >= deadline:
             raise HTTPException(
                 status_code=504,
-                detail=f"Suno 生成超时（{timeout}s，task_id={task_id}）",
+                detail=(
+                    f"Suno 生成超时（{timeout}s，task_id={task_id}）；"
+                    "任务已扣费且已记账，重试会免费重查这张票据"
+                ),
             )
         await asyncio.sleep(interval)
 
@@ -698,7 +754,11 @@ DOWNLOAD_SUFFIXES = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
 
 
 async def _materialize(
-    client: httpx.AsyncClient, record: dict[str, Any], stem: str, index: int
+    client: httpx.AsyncClient,
+    record: dict[str, Any],
+    stem: str,
+    index: int,
+    on_stage: Optional[Callable[[str], None]] = None,
 ) -> tuple[Path, float]:
     """下载并转码单个片段，返回 (WAV 路径, 时长秒)。index 0 用主文件名。"""
     audio_url = record["audio_url"]
@@ -709,8 +769,11 @@ async def _materialize(
     # 「same as Input」，且 finally 里的 unlink 会连成品一起删掉
     source = OUTPUT_DIR / f"{stem}_{index}_src{suffix}"
     target = OUTPUT_DIR / (f"{stem}.wav" if index == 0 else f"{stem}_{index}.wav")
+    stage = on_stage or (lambda _name: None)
     try:
+        stage("downloading")
         await _download(client, audio_url, source)
+        stage("transcoding")
         await _to_wav(source, target)
     finally:
         source.unlink(missing_ok=True)
@@ -737,6 +800,212 @@ async def _materialize(
     return target, duration
 
 
+SOURCE_SUBMIT = "submit"
+SOURCE_REFETCH = "refetch"
+SOURCE_CACHE = "cache"
+
+
+@dataclass
+class GenerationResult:
+    """一次生成的结果 + 这次到底有没有花钱。
+
+    `source` 是给前端看的计费语义，三种都不含糊：
+    - `submit`：本次真的建了单（扣费）；
+    - `refetch`：账本里有已扣费票据，这次只做了免费的 fetch + 下载；
+    - `cache`：WAV 已在盘上，连网络请求都没发。
+    """
+
+    fingerprint: str
+    task_id: str
+    clips: list[ClipRef]
+    source: str
+    elapsed_sec: float
+
+    @property
+    def reused(self) -> bool:
+        return self.source != SOURCE_SUBMIT
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "fingerprint": self.fingerprint,
+            "task_id": self.task_id,
+            "source": self.source,
+            "reused": self.reused,
+            "clips": [clip.public() for clip in self.clips],
+            "elapsed_sec": round(self.elapsed_sec, 1),
+        }
+
+
+def validate_continue(continue_clip_id: str, continue_at: Optional[float]) -> str:
+    """续写参数校验，同步端点与任务端点共用，返回清洗后的 clip_id。"""
+    clip_id = continue_clip_id.strip()
+    if clip_id and not CLIP_ID_RE.match(clip_id):
+        raise HTTPException(status_code=422, detail="continue_clip_id 仅允许字母、数字、下划线和中划线")
+    if continue_at is not None and not clip_id:
+        raise HTTPException(status_code=422, detail="continue_at 需要配合 continue_clip_id 使用")
+    if continue_at is not None and not 0 <= continue_at <= MAX_CONTINUE_AT:
+        raise HTTPException(status_code=422, detail=f"continue_at 需要在 0–{int(MAX_CONTINUE_AT)} 秒之间")
+    return clip_id
+
+
+async def _land_clips(
+    client: httpx.AsyncClient,
+    fp: str,
+    task_id: str,
+    records: list[dict[str, Any]],
+    known: list[ClipRef],
+    emit: ProgressHook,
+) -> list[ClipRef]:
+    """把上游片段落盘成 WAV，已在账本里的直接复用，只下载差集。
+
+    改造前第 2 条下载失败会把第 1 条已落盘的 WAV 一起删掉，下次重试两条重下。
+    现在已落地的先 `mark_ready` 兑现进账本，重试只补缺的那条 —— 两条都已经付过钱，
+    重下不花钱但白等一次转码，删掉更是把免费恢复的机会扔了。
+    """
+    by_clip_id = {clip.clip_id: clip for clip in known if clip.clip_id}
+    result: list[ClipRef] = []
+    newly: list[ClipRef] = []
+    total = len(records)
+
+    for index, record in enumerate(records):
+        existing = by_clip_id.get(record.get("clip_id") or "")
+        if existing is not None:
+            result.append(existing)
+            emit({"phase": "downloading", "clip_index": index, "clip_total": total, "clip_reused": True})
+            logger.info(
+                "suno clip already on disk: task=%s clip=%s file=%s",
+                task_id,
+                existing.clip_id,
+                existing.filename,
+            )
+            continue
+
+        def stage(name: str, _index: int = index) -> None:
+            emit({"phase": name, "clip_index": _index, "clip_total": total, "clip_reused": False})
+
+        stem = f"suno_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        try:
+            path, duration = await _materialize(client, record, stem, index, on_stage=stage)
+        except HTTPException:
+            if newly:
+                generate_cache.mark_ready(fp, newly)
+            raise
+        # 落盘名里那 6 位是本地的 uuid4，不是 Suno 的 clip_id；不记这一笔，
+        # 结构分析接口就只能靠文件名找人
+        clip_index.record(record.get("clip_id"), path.name, task_id)
+        ref = ClipRef(clip_id=record.get("clip_id"), filename=path.name, duration=duration)
+        result.append(ref)
+        newly.append(ref)
+
+    return result
+
+
+async def run_generation(
+    prompt: str,
+    *,
+    continue_clip_id: Optional[str] = None,
+    continue_at: Optional[float] = None,
+    max_clips: int = 1,
+    on_progress: Optional[ProgressHook] = None,
+) -> GenerationResult:
+    """生成主链路：查账本 →（必要时）建单记账 → 轮询 → 落盘兑现。
+
+    同步端点 `/api/generate` 与任务端点 `/api/generate/jobs` 共用这一个函数，
+    所以「防重复计费」在两条入口上是同一套行为，不会一边省钱一边花钱。
+
+    记账的时机是契约的一部分：`_submit` 一返回 task_id 就 `mark_submitted`，
+    中间不插任何可失败的 await —— 否则一次轮询超时或 `--reload` 重启就会把票据丢掉，
+    下一次同样的请求重新建单、重新扣费。
+    """
+    started = time.perf_counter()
+    emit = on_progress or _noop_progress
+    wanted = min(max(1, max_clips), MAX_CLIPS_PER_TASK)
+    payload = build_payload(prompt, continue_clip_id, continue_at)
+    fp = generate_cache.fingerprint(payload)
+    base, headers = _upstream()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    timeout = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        entry = generate_cache.lookup(fp)
+        known = entry.live_clips() if entry else []
+
+        if entry is not None and entry.state == generate_cache.STATE_READY and len(known) >= wanted:
+            emit({"phase": "done", "source": SOURCE_CACHE, "task_id": entry.task_id})
+            logger.info(
+                "suno cache hit: fp=%s task=%s clips=%d（未建单、未请求上游）",
+                fp,
+                entry.task_id,
+                len(known),
+            )
+            return GenerationResult(
+                fingerprint=fp,
+                task_id=entry.task_id,
+                clips=known[:wanted],
+                source=SOURCE_CACHE,
+                elapsed_sec=time.perf_counter() - started,
+            )
+
+        if entry is not None:
+            # 票据在但 WAV 没落地（超时 / 下载失败 / 文件被清）：重查是幂等 GET，免费
+            task_id = entry.task_id
+            source = SOURCE_REFETCH
+            emit({"phase": "generating", "source": source, "task_id": task_id})
+            logger.info(
+                "suno ledger refetch: fp=%s task=%s state=%s live=%d/%d（不建单）",
+                fp,
+                task_id,
+                entry.state,
+                len(known),
+                wanted,
+            )
+        else:
+            emit({"phase": "submitting", "source": SOURCE_SUBMIT})
+            task_id = await _submit(client, base, headers, payload)
+            generate_cache.mark_submitted(fp, task_id, payload)
+            source = SOURCE_SUBMIT
+            emit({"phase": "generating", "source": source, "task_id": task_id})
+            if continue_clip_id:
+                logger.info("suno continue: clip=%s at=%s", continue_clip_id, continue_at)
+            logger.info("suno task submitted: %s fp=%s", task_id, fp)
+
+        wait_started = time.perf_counter()
+        try:
+            records = await _wait_for_audio(
+                client, base, headers, task_id, wanted, on_tick=emit
+            )
+        except UpstreamTaskFailed as exc:
+            # 只有上游判死才允许再次付费；本地超时保持 submitted
+            generate_cache.mark_failed(fp, str(exc.detail))
+            raise
+        logger.info(
+            "suno task ready: %s (%.1fs) clips=%d ids=%s",
+            task_id,
+            time.perf_counter() - wait_started,
+            len(records),
+            [record["clip_id"] for record in records],
+        )
+
+        clips = await _land_clips(client, fp, task_id, records, known, emit)
+        generate_cache.mark_ready(fp, clips)
+        logger.info(
+            "suno dual mount: task=%s kept=%d/%d source=%s",
+            task_id,
+            len(clips),
+            wanted,
+            source,
+        )
+
+    emit({"phase": "done", "source": source, "task_id": task_id})
+    return GenerationResult(
+        fingerprint=fp,
+        task_id=task_id,
+        clips=clips,
+        source=source,
+        elapsed_sec=time.perf_counter() - started,
+    )
+
+
 @router.post("/generate")
 async def generate_music(
     request: Request,
@@ -746,89 +1015,53 @@ async def generate_music(
     continue_at: Optional[float] = Form(default=None),
     max_clips: int = Form(default=1),
 ):
-    """同步代理 Suno：提交任务 → 轮询 → 下载 → 转 WAV → 返回音频流。
+    """同步代理 Suno：查账本 →（必要时）提交 → 轮询 → 下载 → 转 WAV → 返回音频流。
+
+    保留这条同步入口是为了兼容既有调用与注入验证；需要中间进度时用
+    `POST /api/generate/jobs` + `GET /api/generate/jobs/{job_id}`，两者共用 `run_generation`。
 
     `duration` 仅为兼容前端占位字段，实际时长由 Suno 根据歌词决定。
     带 `continue_clip_id` 时改为续写：上游把该 clip 在 `continue_at` 秒之前的音频当作创作上下文，
     返回一段在其后**新生成**的音频（不是原音频的延长版，适合当作该段的额外候选试听）。
     `max_clips=2` 时把同一任务的第 2 个片段也下载转码，以 base64(JSON) 放在
     `X-Suno-Extra-Clips` 响应头里返回，避免已扣费的双生结果被丢弃。
+    `X-Suno-Source` 回传本次是 submit / refetch / cache，让调用方能确认有没有再花钱。
     """
     del duration
-    clip_id = continue_clip_id.strip()
-    if clip_id and not CLIP_ID_RE.match(clip_id):
-        raise HTTPException(status_code=422, detail="continue_clip_id 仅允许字母、数字、下划线和中划线")
-    if continue_at is not None and not clip_id:
-        raise HTTPException(status_code=422, detail="continue_at 需要配合 continue_clip_id 使用")
-    if continue_at is not None and not 0 <= continue_at <= MAX_CONTINUE_AT:
-        raise HTTPException(status_code=422, detail=f"continue_at 需要在 0–{int(MAX_CONTINUE_AT)} 秒之间")
-    wanted_clips = min(max(1, max_clips), MAX_CLIPS_PER_TASK)
+    clip_id = validate_continue(continue_clip_id, continue_at)
+    result = await run_generation(
+        prompt,
+        continue_clip_id=clip_id or None,
+        continue_at=continue_at,
+        max_clips=max_clips,
+    )
+    if not result.clips:
+        raise HTTPException(status_code=502, detail=f"Suno 任务没有落盘任何音频：task_id={result.task_id}")
 
-    base, headers = _upstream()
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    timeout = httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        task_id = await _submit(client, base, headers, prompt, clip_id or None, continue_at)
-        if clip_id:
-            logger.info("suno continue: clip=%s at=%s", clip_id, continue_at)
-        logger.info("suno task submitted: %s", task_id)
-
-        started = time.perf_counter()
-        records = await _wait_for_audio(client, base, headers, task_id, wanted_clips)
-        logger.info(
-            "suno task ready: %s (%.1fs) clips=%d ids=%s",
-            task_id,
-            time.perf_counter() - started,
-            len(records),
-            [record["clip_id"] for record in records],
-        )
-
-        stem = f"suno_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-        materialized: list[tuple[Path, float]] = []
-        for index, record in enumerate(records):
-            try:
-                path, _duration = await _materialize(client, record, stem, index)
-            except HTTPException:
-                for landed, _ in materialized:
-                    landed.unlink(missing_ok=True)
-                raise
-            materialized.append((path, _duration))
-            # 落盘名里那 6 位是本地的 uuid4，不是 Suno 的 clip_id；不记这一笔，
-            # GET /api/analyze_structure?clip_id= 就只能靠文件名找人
-            clip_index.record(record.get("clip_id"), path.name, task_id)
-
-        base_url = str(request.base_url).rstrip("/")
-        extras = [
-            {
-                "clipId": records[index]["clip_id"],
-                "url": f"{base_url}/static/output/{materialized[index][0].name}",
-                "duration": round(materialized[index][1], 3),
-            }
-            for index in range(1, len(materialized))
-        ]
-        logger.info(
-            "suno dual mount: task=%s kept=%d/%d extras=%d",
-            task_id,
-            len(materialized),
-            wanted_clips,
-            len(extras),
-        )
-
-    target, _ = materialized[0]
+    base_url = str(request.base_url).rstrip("/")
+    extras = [
+        {
+            "clipId": clip.clip_id,
+            "url": f"{base_url}/static/output/{clip.filename}",
+            "duration": round(clip.duration, 3),
+        }
+        for clip in result.clips[1:]
+    ]
     extra_header = (
         base64.b64encode(json.dumps(extras, ensure_ascii=True).encode("utf-8")).decode("ascii")
         if extras
         else ""
     )
+    target = OUTPUT_DIR / result.clips[0].filename
 
     return FileResponse(
         target,
         media_type="audio/wav",
         filename=target.name,
         headers={
-            "X-Suno-Task-Id": task_id,
-            "X-Suno-Clip-Id": records[0]["clip_id"] or "",
+            "X-Suno-Task-Id": result.task_id,
+            "X-Suno-Clip-Id": result.clips[0].clip_id or "",
             "X-Suno-Extra-Clips": extra_header,
+            "X-Suno-Source": result.source,
         },
     )

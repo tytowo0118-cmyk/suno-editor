@@ -15,6 +15,8 @@ import {
   CANDIDATES_PER_SECTION,
   GENERATE_ENDPOINT,
   TASKS_PER_SECTION,
+  billingNote,
+  describeGenerateJob,
   generateTakes,
   revokeTakeAudio,
 } from "@/lib/musicgen";
@@ -33,7 +35,14 @@ import {
   takeFromStored,
 } from "@/lib/session";
 import type { SessionSnapshot } from "@/lib/session";
-import type { Notice, NoticeLevel, StitchResult, Take, TimelineSection } from "@/lib/types";
+import type {
+  GenerateJob,
+  Notice,
+  NoticeLevel,
+  StitchResult,
+  Take,
+  TimelineSection,
+} from "@/lib/types";
 import SongBriefPanel from "./SongBriefPanel";
 import TakeCard from "./TakeCard";
 import Timeline from "./Timeline";
@@ -65,17 +74,84 @@ function restoreLockedTakes(session: SessionSnapshot | null): Record<string, Tak
   );
 }
 
-/** 恢复结果直接做成首帧提示，而不是在 effect 里 setState：少一次渲染，也不会被时序坑 */
-function restoredNotice(session: SessionSnapshot | null): Notice | null {
+/**
+ * 候选列表回填。任务式生成之后候选也是 `/static` 落盘地址，刷新后照样能播，所以一并还原 ——
+ * 否则时间轴写着「已锁定 Take A」而下方卡片是「暂无候选」，同一份现场自己跟自己矛盾。
+ *
+ * 旧快照（没有 `takes` 字段）只在**该段列表为空**时用锁定项兜出一条候选：
+ * `loadTakes` 是整段替换候选但保留锁定的，所以「锁定项不在候选列表里」是合法状态，
+ * 不能无条件把它塞回非空列表 —— 那会凭空多出一张上一次生成时已被替换掉的卡片。
+ */
+function restoreTakes(session: SessionSnapshot | null): Record<string, Take[]> {
+  if (!session) return {};
+  const restored: Record<string, Take[]> = {};
+  session.sections.forEach((section) => {
+    const stored = session.takes[section.id] ?? [];
+    if (stored.length > 0) {
+      restored[section.id] = stored.map(takeFromStored);
+      return;
+    }
+    const locked = session.locked[section.id];
+    if (locked) restored[section.id] = [takeFromStored(locked)];
+  });
+  return restored;
+}
+
+/**
+ * 恢复结果直接做成首帧提示，而不是在 effect 里 setState：少一次渲染，也不会被时序坑。
+ * 候选数按**实际回填的列表**算，不是按快照里的 `takes` 字段算 —— 旧快照没有那个字段，
+ * 恢复侧会用锁定项兜出一条候选，照快照数就会报「0 条候选」而下方明明有一张卡片。
+ */
+function restoredNotice(
+  session: SessionSnapshot | null,
+  restoredTakes: Record<string, Take[]>,
+): Notice | null {
   if (!session) return null;
+  const lockedCount = Object.keys(session.locked).length;
+  const candidateCount = Object.values(restoredTakes).reduce((sum, list) => sum + list.length, 0);
+  const audioCount = candidateCount + lockedCount + (session.mix ? 1 : 0);
   return {
     text:
-      `已恢复上次现场：${session.sections.length} 段结构、${
-        Object.keys(session.locked).length
-      } 段已锁定${session.mix ? "、成品 1 份" : ""}；` +
-      "未锁定的候选音频存在浏览器内存里，刷新后留不住，需要重新生成",
+      `已恢复上次现场：${session.sections.length} 段结构、${lockedCount} 段已锁定、` +
+      `${candidateCount} 条候选${session.mix ? "、成品 1 份" : ""}；` +
+      // 探活是挂载后异步跑的，首帧只能说「正在核对」，不能把还没做的事说成做完了
+      (audioCount > 0
+        ? "音频都是后端落盘地址，正在核对文件是否还在（缺的会被点名剔除）"
+        : "歌词与结构还在，可以直接逐段生成"),
     level: "info",
   };
+}
+
+/** 探活并发上限：候选最多 12 段 × 24 条，一次性放出去会把本地静态服务和本页连接数打满 */
+const PROBE_CONCURRENCY = 8;
+
+/** HEAD 幂等且不碰上游；返回拿不到文件的地址集合（网络错误与 404 同等对待） */
+async function probeAudioUrls(urls: string[]): Promise<Set<string>> {
+  const dead = new Set<string>();
+  let cursor = 0;
+  const worker = async () => {
+    // 读下标与自增之间没有 await，JS 单线程下不会有两个 worker 抢到同一条
+    while (cursor < urls.length) {
+      const url = urls[cursor++];
+      try {
+        const response = await fetch(url, { method: "HEAD", cache: "no-store" });
+        if (!response.ok) dead.add(url);
+      } catch {
+        dead.add(url);
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(PROBE_CONCURRENCY, urls.length) }, () => worker()),
+  );
+  return dead;
+}
+
+/** 点名要有上限：24 条候选全丢时把 24 个名字铺满浮层，反而看不清「丢了几条」 */
+function nameLosses(labels: string[], max = 6): string {
+  const unique = [...new Set(labels)];
+  if (unique.length <= max) return unique.join("、");
+  return `${unique.slice(0, max).join("、")} 等 ${unique.length} 处`;
 }
 
 export default function Studio() {
@@ -86,19 +162,21 @@ export default function Studio() {
     session ? session.sections.map(sectionFromStored) : INITIAL_SECTIONS,
   );
   const [activeId, setActiveId] = useState<string>(() => session?.activeId ?? INITIAL_SECTIONS[0].id);
-  const [takes, setTakes] = useState<Record<string, Take[]>>({});
+  const [takes, setTakes] = useState<Record<string, Take[]>>(() => restoreTakes(session));
   const [locked, setLocked] = useState<Record<string, Take>>(() => restoreLockedTakes(session));
   const [prompts, setPrompts] = useState<Record<string, string>>(
     () => session?.prompts ?? buildInitialPrompts(),
   );
   const [loading, setLoading] = useState<Record<string, boolean>>({});
+  // 每段 TASKS_PER_SECTION 个并发任务各自的最新状态，用来显示阶段 / 上游状态 / 已耗时
+  const [genJobs, setGenJobs] = useState<Record<string, (GenerateJob | null)[]>>({});
   const [errors, setErrors] = useState<Record<string, string | null>>({});
   const [mix, setMix] = useState<StitchResult | null>(() =>
     session?.mix ? mixFromStored(session.mix) : null,
   );
   const [mixCurrentTime, setMixCurrentTime] = useState(0);
   const [stitching, setStitching] = useState(false);
-  const [notice, setNotice] = useState<Notice | null>(() => restoredNotice(session));
+  const [notice, setNotice] = useState<Notice | null>(() => restoredNotice(session, takes));
   const [songPrompt, setSongPrompt] = useState(() => session?.songPrompt || DEFAULT_SONG_PROMPT);
   const [lyrics, setLyrics] = useState(() => session?.lyrics ?? "");
   const [lyricsLoading, setLyricsLoading] = useState(false);
@@ -108,6 +186,8 @@ export default function Studio() {
   const lockedRef = useRef(locked);
   const takesRef = useRef(takes);
   const promptsRef = useRef(prompts);
+  // 探活要判断「现在这份成品还是不是恢复出来的那一份」，避免把探活期间新拼的成品误判为作废
+  const mixRef = useRef(mix);
   const requestSeq = useRef<Record<string, number>>({});
   // 结构重建后旧请求的响应必须作废，epoch 递增即失效
   const epochRef = useRef(0);
@@ -129,6 +209,10 @@ export default function Studio() {
   useEffect(() => {
     promptsRef.current = prompts;
   }, [prompts]);
+
+  useEffect(() => {
+    mixRef.current = mix;
+  }, [mix]);
 
   // 第一页的实时预览：与确认后实际构建的结构完全一致
   const briefPreview = useMemo(() => {
@@ -167,50 +251,87 @@ export default function Studio() {
 
   /**
    * 地址格式对 ≠ 文件还在：`static/` 被清过、换机器、换容器都会让快照里的 `/static` 地址变 404。
-   * 恢复完就并发探一次（HEAD，本地静态文件，不碰 Suno、不扣费），死链按「我们这边失败」处理 ——
-   * 点名是哪几段，把它们退回未锁定、成品作废，而不是留一个点开才报错的假锁定状态。
+   * 恢复完就探一次活（HEAD，本地静态文件，不碰 Suno、不扣费，并发封顶 `PROBE_CONCURRENCY`），
+   * 死链按「我们这边失败」处理 —— 锁定退回未锁定、候选从列表里剔除、成品作废，并以 error 级
+   * 常驻提示点名到「段 + Take」，而不是留一个点开才报错的假锁定状态或一张播不出声的卡片。
    */
   const probeRestoredAudio = useCallback(
     async (snapshot: SessionSnapshot) => {
-      const labelsByUrl = new Map<string, string[]>();
-      const track = (url: string, label: string) => {
-        labelsByUrl.set(url, [...(labelsByUrl.get(url) ?? []), label]);
-      };
+      const titleOf = (sectionId: string) =>
+        snapshot.sections.find((section) => section.id === sectionId)?.title ?? sectionId;
+
+      // 锁定 / 候选 / 成品分开记账：三者丢失的后果不同，提示不能混成一句「已退回未锁定」
+      const lockedLabels = new Map<string, string[]>();
       Object.entries(snapshot.locked).forEach(([sectionId, take]) => {
-        const title = snapshot.sections.find((section) => section.id === sectionId)?.title;
-        track(take.audioUrl, title ?? sectionId);
+        lockedLabels.set(take.audioUrl, [
+          ...(lockedLabels.get(take.audioUrl) ?? []),
+          titleOf(sectionId),
+        ]);
       });
-      if (snapshot.mix) track(snapshot.mix.audioUrl, "成品");
-      if (labelsByUrl.size === 0) return;
+      // 候选按 id 记名字，并留一份「恢复出来的 id」白名单：探活期间用户可能已经点了「生成候选」，
+      // 新列表的 id 不在白名单里，这次探活结果就不会误伤刚花钱拿到的新候选
+      const candidateLabelById = new Map<string, string>();
+      const candidateUrls = new Set<string>();
+      Object.entries(snapshot.takes).forEach(([sectionId, list]) => {
+        list.forEach((take) => {
+          candidateLabelById.set(take.id, `${titleOf(sectionId)} ${take.label}`);
+          candidateUrls.add(take.audioUrl);
+        });
+      });
+      const mixUrl = snapshot.mix?.audioUrl ?? null;
+      const urls = [
+        ...new Set([...lockedLabels.keys(), ...candidateUrls, ...(mixUrl ? [mixUrl] : [])]),
+      ];
+      if (urls.length === 0) return;
 
-      const dead: string[] = [];
-      await Promise.all(
-        [...labelsByUrl.keys()].map(async (url) => {
-          try {
-            const response = await fetch(url, { method: "HEAD", cache: "no-store" });
-            if (!response.ok) dead.push(url);
-          } catch {
-            dead.push(url);
-          }
-        }),
-      );
-      if (dead.length === 0) return;
+      const dead = await probeAudioUrls(urls);
+      if (dead.size === 0) return;
 
-      const deadSet = new Set(dead);
-      const lostLabels = dead.flatMap((url) => labelsByUrl.get(url) ?? []);
+      // 剔除以**当前** state 为准（探活是异步的），名字取自快照；
+      // 只统计真的被摘掉的条目，避免为一份早已被替换的列表报警
+      const lostLocked: string[] = [];
       const nextLocked: Record<string, Take> = {};
       Object.entries(lockedRef.current).forEach(([sectionId, take]) => {
-        if (take && !deadSet.has(take.audioUrl)) nextLocked[sectionId] = take;
+        if (take && dead.has(take.audioUrl)) {
+          lostLocked.push(titleOf(sectionId));
+          return;
+        }
+        if (take) nextLocked[sectionId] = take;
       });
       lockedRef.current = nextLocked;
       setLocked(nextLocked);
-      if (snapshot.mix && deadSet.has(snapshot.mix.audioUrl)) {
+
+      const lostTakes: string[] = [];
+      const nextTakes: Record<string, Take[]> = {};
+      Object.entries(takesRef.current).forEach(([sectionId, list]) => {
+        const kept = list.filter((take) => {
+          if (!candidateLabelById.has(take.id) || !dead.has(take.audioUrl)) return true;
+          lostTakes.push(candidateLabelById.get(take.id) ?? `${titleOf(sectionId)} ${take.label}`);
+          return false;
+        });
+        if (kept.length > 0) nextTakes[sectionId] = kept;
+      });
+      takesRef.current = nextTakes;
+      setTakes(nextTakes);
+
+      const mixLost = Boolean(mixUrl && dead.has(mixUrl) && mixRef.current?.audioUrl === mixUrl);
+      if (mixLost) {
+        mixRef.current = null;
         setMix(null);
         setMixCurrentTime(0);
       }
+
+      const consequences: string[] = [];
+      if (lostLocked.length > 0) consequences.push(`${nameLosses(lostLocked)}（已退回未锁定）`);
+      if (mixLost) consequences.push("成品已作废");
+      if (lostTakes.length > 0) {
+        consequences.push(`${lostTakes.length} 条候选已剔除（${nameLosses(lostTakes)}）`);
+      }
+      // 死链全属于已经被替换掉的旧列表：当前界面不再指向它们，没有可报告的损失
+      if (consequences.length === 0) return;
       notify(
-        `恢复的 ${lostLabels.length} 条音频在后端磁盘上已经找不到了（${lostLabels.join("、")}）：` +
-          `相关段落已退回未锁定，需要重新生成；结构和歌词还在，不用重头再来`,
+        `恢复的 ${dead.size} 个音频文件在后端磁盘上已经找不到了：${consequences.join("；")}。` +
+          "结构和歌词还在，不用重头再来；后端账本若仍在，重新生成会免费重取已扣费的结果",
         "error",
       );
     },
@@ -224,7 +345,7 @@ export default function Studio() {
     void probeRestoredAudio(session);
   }, [session, probeRestoredAudio]);
 
-  // 现场一变就落盘：step / 歌词 / 段落 / 锁定 / 提示词草稿 / 成品（机制与取舍见 lib/session.ts）
+  // 现场一变就落盘：step / 歌词 / 段落 / 候选 / 锁定 / 提示词草稿 / 成品（机制与取舍见 lib/session.ts）
   useEffect(() => {
     saveSession(
       captureSession({
@@ -234,12 +355,13 @@ export default function Studio() {
         lyrics,
         activeId,
         sections,
+        takes,
         locked,
         prompts,
         mix,
       }),
     );
-  }, [step, structureReady, songPrompt, lyrics, activeId, sections, locked, prompts, mix]);
+  }, [step, structureReady, songPrompt, lyrics, activeId, sections, takes, locked, prompts, mix]);
 
   // Suno 按歌词自行决定演唱时长，时间轴以实际返回音频为准，不再强制对齐预估秒数
   const applyNaturalDuration = useCallback((sectionId: string, duration: number) => {
@@ -273,13 +395,25 @@ export default function Studio() {
     pauseAllAudio();
     setLoading((prev) => ({ ...prev, [sectionId]: true }));
     setErrors((prev) => ({ ...prev, [sectionId]: null }));
+    setGenJobs((prev) => ({
+      ...prev,
+      [sectionId]: Array.from({ length: TASKS_PER_SECTION }, () => null),
+    }));
 
     try {
-      const generated = await generateTakes({
+      const { takes: generated, sources } = await generateTakes({
         sectionId,
         prompt,
         durationSec: section.durationSec,
         count: TASKS_PER_SECTION,
+        onProgress: (job, taskIndex) => {
+          if (epochRef.current !== epoch || requestSeq.current[sectionId] !== seq) return;
+          setGenJobs((prev) => {
+            const slots = [...(prev[sectionId] ?? [])];
+            slots[taskIndex] = job;
+            return { ...prev, [sectionId]: slots };
+          });
+        },
       });
       if (epochRef.current !== epoch || requestSeq.current[sectionId] !== seq) {
         revokeTakeAudio(generated);
@@ -290,8 +424,13 @@ export default function Studio() {
         return { ...prev, [sectionId]: generated };
       });
       // 已锁定的段落以锁定音频为准，避免重新生成时改变成品布局
-      if (!lockedRef.current[sectionId]) {
+      if (!lockedRef.current[sectionId] && generated[0]) {
         applyNaturalDuration(sectionId, generated[0].duration);
+      }
+      // 命中账本是「这次没花钱」的好消息，值得一条提示；正常建单不用刷屏，
+      // 计费语义在进度条里常驻显示（info 提示 3.2s 就没了，进度条不会）
+      if (sources.some((source) => source !== "submit")) {
+        notify(billingNote(sources) ?? "复用已扣费结果");
       }
     } catch (error) {
       if (epochRef.current !== epoch || requestSeq.current[sectionId] !== seq) return;
@@ -323,6 +462,7 @@ export default function Studio() {
     setLocked({});
     setPrompts(nextPrompts);
     setLoading({});
+    setGenJobs({});
     setErrors({});
     setMix(null);
     setActiveId(nextSections[0].id);
@@ -441,7 +581,7 @@ export default function Studio() {
     const index = currentSections.findIndex((section) => section.id === sectionId);
     if (index < 0) return;
 
-    // 生成的音频是内存 Blob，先落盘换静态地址，拼接接口才能读到
+    // 候选现在生成即落盘、直接是 /static 地址；blob 分支只兜历史现场，遇到才上传换静态地址
     let stored = take;
     if (take.audioUrl.startsWith("blob:")) {
       try {
@@ -527,6 +667,7 @@ export default function Studio() {
   const activeSection = sections[activeIndex] ?? sections[0];
   const activeTakes = takes[activeSection.id] ?? [];
   const activeLoading = Boolean(loading[activeSection.id]);
+  const activeGenJobs = genJobs[activeSection.id] ?? [];
   const activeError = errors[activeSection.id];
   const naturalDuration = locked[activeSection.id]?.duration ?? activeTakes[0]?.duration;
   const lockedCount = sections.filter((section) => locked[section.id]).length;
@@ -749,6 +890,34 @@ export default function Studio() {
                     </p>
                   </div>
                 </div>
+
+                {activeGenJobs.some(Boolean) && (
+                  <div className="mt-5 rounded-xl border border-white/[0.06] bg-black/20 px-4 py-3">
+                    <div className="space-y-1">
+                      {activeGenJobs.map((job, index) => {
+                        const status = job ? describeGenerateJob(job) : null;
+                        return (
+                          <p
+                            key={job?.jobId ?? `pending-${index}`}
+                            className={`font-mono text-[10px] ${
+                              status?.failed ? "text-rose-300/90" : "text-zinc-400"
+                            }`}
+                          >
+                            任务 {index + 1}/{TASKS_PER_SECTION} ·{" "}
+                            {status ? status.label : "提交中"}
+                            {status?.billing && (
+                              <span className="text-emerald-300/80"> · {status.billing}</span>
+                            )}
+                          </p>
+                        );
+                      })}
+                    </div>
+                    <p className="mt-2 text-[10px] leading-relaxed text-zinc-600">
+                      刷新或关掉页面不会重复计费：建单成功即按内容指纹记进后端账本，
+                      同样内容重试是免费重查那条已扣费的任务；片段已落盘时连上游都不请求。
+                    </p>
+                  </div>
+                )}
 
                 {activeError && (
                   <div
