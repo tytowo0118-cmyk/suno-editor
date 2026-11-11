@@ -1025,15 +1025,25 @@ info 档 3.2 s 就消失」的观察窗口。下面这批前端实测录于**每
   `static/output` 新增 **0 个**文件、账本 sha `c137fe3a…0780` 与 mtime 逐位未变 —— 没花钱。
   换算口径另有 14 项容器内断言（`frontend/scripts/verify_continue_seed.ts`，跑法见文件头注释）。
 - **逐段续写真实链路（2026-11-11 实测，1 次扣费）**：真实 UI 跑「前奏 + 主歌 1（2 行歌词）」两段。
-  第 1 段命中账本（`fp=14b24397f673`）→ 只有 **1 个 GET**、**0 次建单**，两条候选本地裁到 8.0s；
+  第 1 段命中账本（`fp=14b24397f673`）→ 只有 **1 个 GET**、**0 次建单**，两条候选走的是
+  **先检测再截取**：对上游整首（205.560s）跑 `boundary_candidates`，放宽窗 `[6.000, 8.000]`
+  内 **candidates=0** ⇒ `pick=none snapped=False` ⇒ 才回退到规划秒数，日志
+  `clip_trimmed: source=205.560s kept=8.000s target=8.000s search=2.000s snapped=False`。
+  **所以 8.000s 是"窗内没有边界"的回退值，不是按秒表硬切** —— 同一判据在有候选的素材上会吸附，
+  同一批日志里就有 `kept=16.945s target=18.500s cut=16.945s snapped=True pick=wide strength=0.316`。
   锁 `Take A`（`clip_id=95c73eba…`）后第 2 段发 1 个 POST，body 带
   `continue_clip_id=95c73eba…` / `continue_at=8`，后端打 `suno continue: clip=… at=8.0`，
   上游 **58.6 s** 回 2 条（`44.232 / 48.696 s`），`task_lWlnzWJB9c3bRSzr…`、`fp=e7ff410803a2`、
   账本 2 → 3 条。整轮 `POST /suno/submit/music` **1 条**、`suno task submitted` **1 行**
   = 只扣一次费。拼接成品 51.823s / peak −3.3 dBFS。
   **续写点与硬切点是同一个点**：`continue_at=8.0` 对成品里的接缝 `segment_start_sec[1]=7.992`
-  （= 8.0 − 8 ms 交叉淡化），即上游听见的最后一个采样位置正是本地刀口所在。
-  接缝指标（零成本重拼对照：第一段素材与切点不动，只把第二段换成**早前已扣费的独立生成**片段，
+  （= 8.0 − 8 ms 交叉淡化），即上游听见的最后一个采样位置正是本地刀口所在 —— 两边同源于
+  上一步那个**检测出来的**秒数，改裁短口径时两处一起跟着挪。
+  第二段有词、不裁：44.232s 整条进混音，只被拼接侧剔掉头尾静音 0.393 / 0.008s
+  （8.000 + 43.831 − 0.008 = 51.823，逐位对得上）。
+  接缝指标（零成本重拼对照：三条混音共用**同一次检测产出的**上一段成品文件，探针里
+  `--prev-max-sec 8` 对它是 no-op（文件本来就只有 8.000s，`_truncate_to_length` 直接早退、
+  不再检测），所以接缝都在 7.992，唯一变量是第二段的来路；第二段同样不裁。
   同判据、同一条 `/api/stitch` 路径；探针 `backend/scripts/probe_seam_continuity.py`，
   跑法与全部口径写在文件头，**同一批数字连跑三遍逐位复现**）：
 
