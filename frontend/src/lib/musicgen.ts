@@ -1,5 +1,6 @@
 import { API_BASE, runGenerateJob, trimAudio } from "./api";
-import type { GenerateJob, GenerateSource, Take } from "./types";
+import { plannedTruncateSec } from "./lyrics";
+import type { GenerateJob, GenerateSource, Take, TimelineSection } from "./types";
 
 /** FastAPI 后端的生成任务端点：提交拿 job_id，轮询读阶段进度（旧的同步 /api/generate 仍保留） */
 export const GENERATE_ENDPOINT = `${API_BASE}/api/generate/jobs`;
@@ -160,9 +161,40 @@ export function describeGenerateJob(job: GenerateJob): {
 }
 
 /**
+ * 上一段「已锁定候选」换算成本段续写的种子：`continue_clip_id` + `continue_at`。
+ *
+ * 两个不显然的口径：
+ * 1. `/api/trim` 只往 `/static` 写新 WAV，**不产 clip_id**（响应里只有 audio_url /
+ *    duration / source_duration / snapped），所以续写只能回指上游原片的 clip_id。
+ *    好在裁短保留的正是原片 `[0, cut]`，`take.duration` 就是原片时间轴上的续写点，
+ *    两者同源，不会出现「本地裁到 8s、上游按 205s 给上下文」的错位。
+ * 2. 有歌词的段落不裁（`plannedTruncateSec` 返回 undefined，时长由唱词决定），
+ *    听得见的末尾就是整条 clip 的末尾；无词段落按规划秒数裁，拼接侧也是这个口径，
+ *    所以裁短失败、候选还躺着 205.6s 整首时，续写点仍取规划秒数，跟着「实际会用到的」走。
+ *
+ * 上一段没锁定、候选没有 clip_id（历史现场的 blob 地址）都返回 undefined，
+ * 调用方据此退回独立整首生成 —— 必须让调用方知道，续写链断了是听得出来的。
+ */
+export function continuationSeed(
+  prevSection: TimelineSection | undefined,
+  prevTake: Take | undefined,
+): { clipId: string; continueAt: number } | undefined {
+  if (!prevSection || !prevTake) return undefined;
+  const clipId = prevTake.clipId?.trim();
+  if (!clipId) return undefined;
+  const planned = plannedTruncateSec(prevSection);
+  const keepSec = planned ? Math.min(prevTake.duration, planned) : prevTake.duration;
+  if (!Number.isFinite(keepSec) || keepSec <= 0) return undefined;
+  // 上游 continue_at 会 round(_, 3)，这里先量化到毫秒，避免浮点尾巴进载荷和指纹
+  return { clipId, continueAt: Math.round(keepSec * 1000) / 1000 };
+}
+
+/**
  * 生成一组候选：并发提交 `count` 个任务，每个任务上游固定产 2 条双生片段，
  * 主片段与 extras 全部挂载成候选 —— 第 2 条同样已扣费，扔掉它等于白付一半钱。
  * 片段地址都是后端 /static 上的 WAV，不需要再下载或建 Blob。
+ * 带 `seed` 时走 Suno 续写：上游拿上一段在 `continueAt` 之前的音频当上下文，本段接在后面，
+ * 接缝处的调性/配器/速度由模型延续，不再是本地 8 ms 硬切缝出来的「换了一首歌」。
  * 任一任务失败则抛错；已扣费的结果留在后端账本里，重试同指纹不会再次计费。
  */
 export async function generateTakes(input: {
@@ -170,6 +202,8 @@ export async function generateTakes(input: {
   prompt: string;
   durationSec: number;
   count?: number;
+  /** 上一段锁定候选换算出的续写种子；缺省即独立整首生成 */
+  seed?: { clipId: string; continueAt: number };
   signal?: AbortSignal;
   onProgress?: (job: GenerateJob, taskIndex: number) => void;
 }): Promise<{ takes: Take[]; sources: GenerateSource[] }> {
@@ -181,6 +215,8 @@ export async function generateTakes(input: {
         prompt: input.prompt,
         durationSec,
         signal: input.signal,
+        continueClipId: input.seed?.clipId,
+        continueAt: input.seed?.continueAt,
         maxClips: CLIPS_PER_TASK,
         onProgress: input.onProgress
           ? (job) => input.onProgress?.(job, taskIndex)

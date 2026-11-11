@@ -16,6 +16,7 @@ import {
   GENERATE_ENDPOINT,
   TASKS_PER_SECTION,
   billingNote,
+  continuationSeed,
   describeGenerateJob,
   generateTakes,
   revokeTakeAudio,
@@ -389,6 +390,23 @@ export default function Studio() {
     // 发给 Suno 的纯文本：风格提示 + 结构标签 + 本段歌词
     const prompt = buildGenerationPrompt(section, stylePrompt);
 
+    // 逐段续写：第 2 段起把上一段「已锁定候选」当种子，让上游接在后面写，
+    // 而不是每段各起一首再由本地 8 ms 硬切缝合（接缝「换了一首歌」的主因）。
+    // 上一段没锁定、或它的候选没有 clip_id（历史现场的 blob 地址）时退回独立整首生成，
+    // 并且必须说出来 —— 续写链断在哪，拼接后是听得出来的，不能让用户以为接上了。
+    const prevSection = index > 0 ? currentSections[index - 1] : undefined;
+    const seed = prevSection
+      ? continuationSeed(prevSection, lockedRef.current[prevSection.id])
+      : undefined;
+    if (index > 0 && !seed) {
+      notify(
+        prevSection
+          ? `上一段「${prevSection.title}」还没有锁定候选，本段先按独立整首生成，` +
+            "接缝处不会自动接上；锁定上一段后重按本段即可改为续写"
+          : "本段没有可续写的上一段，按独立整首生成",
+      );
+    }
+
     const seq = (requestSeq.current[sectionId] ?? 0) + 1;
     requestSeq.current[sectionId] = seq;
     const epoch = epochRef.current;
@@ -407,6 +425,7 @@ export default function Studio() {
         prompt,
         durationSec: section.durationSec,
         count: TASKS_PER_SECTION,
+        seed,
         onProgress: (job, taskIndex) => {
           if (epochRef.current !== epoch || requestSeq.current[sectionId] !== seq) return;
           setGenJobs((prev) => {

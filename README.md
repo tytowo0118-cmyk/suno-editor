@@ -103,6 +103,8 @@ Suno 由后端代理调用，浏览器不再直连模型服务，也无需处理
 └── frontend/
     ├── Dockerfile                # node:24-slim，npm ci + next dev
     ├── .dockerignore
+    ├── scripts/
+    │   └── verify_continue_seed.ts # 零成本断言：逐段续写的 continue_at 换算口径（14 项）
     └── src/
         ├── app/                  # layout.tsx / page.tsx（`dynamic(..., { ssr: false })` 挂 Studio）/ globals.css
         ├── components/           # Studio / SongBriefPanel / Timeline / TakeCard / WaveformPlayer
@@ -374,6 +376,21 @@ curl -X POST http://127.0.0.1:8000/api/generate \
    `{ prompt, tags, make_instrumental, wait_audio: false }`（配置 `SUNO_MODEL` 时追加 `mv`）；
    携带续写参数时再追加 `continue_clip_id` 与 `continue_at`（秒，保留 3 位小数）。
    `continue_clip_id` 只允许 `[A-Za-z0-9_-]{1,64}`，否则返回 422。
+   - **逐段续写：主链路从第 2 段起接在上一段后面**（2026-11-11 定案）。在此之前每段都是
+     独立整首生成，段与段的音乐连续性只剩本地 8 ms 硬切缝合，接缝处「换了一首歌」是听感上
+     最大的熵增点；现在 `Studio.loadTakes` 用**上一段已锁定候选**换算出种子
+     `{clip_id, continue_at}` 交给 `generateTakes`，由上游延续调性、配器与速度。
+     第 1 段（前奏）没有种子，仍按独立整首生成 + 本地裁短。三个不显然的口径：
+     1) `/api/trim` 只往 `/static` 写新 WAV、**不产 clip_id**（响应仅 `audio_url / duration /
+        source_duration / snapped`），所以续写只能回指上游原片的 `clip_id`；好在裁短保留的正是
+        原片 `[0, cut]`，`take.duration` 就是原片时间轴上的续写点，两处同源、不会错位。
+     2) `continue_at` 取「成品里这段实际听得见的末尾」：无词段夹到规划秒数（裁短没做成、
+        候选还躺着 205.560s 整首时按 8s 走，否则下一段会接在整首末尾，与成品差 197s），
+        有词段不裁就取整条候选秒数；秒数量化到毫秒，避免浮点尾巴让同一段两次生成的载荷指纹不同。
+     3) 上一段没锁定、或它的候选没有 `clip_id`（历史现场的 `blob:` 地址）时**退回独立整首生成
+        并如实提示**，绝不假装接上了 —— 断链是拼接后听得出来的。
+     载荷多这两个字段不额外花钱：建单次数与 `max_clips` 都不变，而 `fingerprint(payload)`
+     哈希全部创作字段（只排 transport 字段），续写与独立生成天然是两条账本条目。
    - **模型版本字段名是 `mv` 不是 `model`**：网关的 `/suno/submit/music` 文档字段表只有
      `prompt / mv / title / tags / make_instrumental / task_id / continue_at / continue_clip_id /
      gpt_description_prompt / notify_hook`，`mv` 取 `chirp-v3-0 / chirp-v3-5 / chirp-v4`。
@@ -499,6 +516,9 @@ curl -X POST http://127.0.0.1:8000/api/generate \
 5. 每个候选保存 `clips[].clip_id`（`Take.clipId`）；`continueTakes()` 用它发起续写，
    并带上 `max_clips=2`，把 `clips[1:]` 以「续写分支 A / B」标签追加为该段的独立子分支
    （卡片序号沿用「候选项 04 / 05」，都停在待选择），不覆盖已锁定的音频。
+   **同一个 `clipId` 也是逐段续写的锚点**：`generateTakes({ seed })` 的种子由
+   `continuationSeed(上一段, 上一段锁定候选)` 换算（口径与理由见 2.3 的「逐段续写」），
+   上一段没锁定或候选没有 `clip_id` 就返回 `undefined`，本段退回独立整首生成并如实提示。
 6. 计费来源由 `job.source` 如实给出，不靠耗时去猜：`billingNote()` 把一次「生成候选」的
    多个任务汇总成一句提示（全 `cache` → 「复用已落盘结果，未再次计费」；全非 `submit` →
    「重查已扣费任务取回结果，未再次计费」；混合 → 「本次建单 N 次，另 M 次复用已扣费结果」），
@@ -700,6 +720,11 @@ curl -X POST http://127.0.0.1:8000/api/assets \
   所以它的定位是「零风险、低频次的改进」，不是主力机制 —— 不触发就原样裁到规划秒数，
   触发时切点一定更短、绝不越上限。真正会命中的场景是素材内部本来就有段落切换
   （比如裁一条已拼好的多段成品，见上表 18.5 s → 16.945 s）。
+  **样本口径要限定**：保留日志覆盖到的建单全是独立整首（`continue=-` 共 12 条、非 `-` 0 条），
+  更早就没法这么说了 —— 日志只留到 2026-11-06，而历史上确实手动跑过一次真实 extend，
+  哪几条是续写产物已经判不出来。能确定的是：extend 返回的片段头部没有曲首语义
+  （它是接在前段之后的新内容，前 8 秒是「中段」不是「开头」），放宽窗在那类素材上**没有可复核的样本**。
+  所以上面这两个百分比不能外推到续写链路 —— 逐段改续写后需要重新取样重算。
 - 左边界不要再放宽了，有实测反例：`suno_1793678609_3932bd` 在 3.280/0.114、4.290/0.228、
   5.300/0.099 有三条候选，最强那条落在 4.290 s —— 窗一旦放宽到规划的 50%（`[4, 8]`），
   8 s 前奏会被切成 4.29 s，砍掉将近一半内容。另外一批候选正好卡在 1.991 s，
@@ -983,6 +1008,19 @@ info 档 3.2 s 就消失」的观察窗口。下面这批前端实测录于**每
   → 上游 SUCCESS · 第 3 拍 → 下载片段 · 1/2 → 转码 WAV · 2/2 → 已落盘 · 本次建单已扣费`，
   全程 **14.0 s**，挂载 `Take A/B/C/D` 四个候选（现为 2 个），时长
   `32.1 / 61.9 / 35.2 / 39.4 s` 与四条素材一致，时间轴该段从 12 s 展开到 **32.1 s**、总长 44.1 s。
+- **逐段续写载荷（2026-11-11 实测，零成本）**：还是这套 fetch 拦截，先往 `sessionStorage`
+  注入现场快照当 fixture（`section-1` 无词前奏 + `section-2` 有词主歌；快照是伪造的，
+  只为把上一段喂进「已锁定」态，`clipId` 用 `probe-seed-clip-001` 这种一眼可辨的假值），
+  两组之间只差 `section-1` 有没有锁定。锁定那条给的是 `duration=205.56`（无词前奏规划 8 s），
+  真 UI 点「生成候选」发出的 body 是
+  `{"prompt":"…[Verse 2]…","continue_clip_id":"probe-seed-clip-001","continue_at":8,"max_clips":2}`
+  —— 候选长于规划时「夹到规划秒数」这条在浏览器里成立，不是只在单测里成立。
+  把 `locked` 从快照里删掉再点一次，body 只剩 `{"prompt":…,"max_clips":2}`（两个 `continue_*`
+  都没了），同一时刻 DOM 采样器抓到退回提示「上一段「前奏」还没有锁定候选，本段先按独立整首生成，
+  接缝处不会自动接上；锁定上一段后重按本段即可改为续写」。
+  两次都是 `blocked=[]`，事后核对花费：近 12 分钟后端 `payload prepared` 日志 **0 条**、
+  `static/output` 新增 **0 个**文件、账本 sha `c137fe3a…0780` 与 mtime 逐位未变 —— 没花钱。
+  换算口径另有 14 项容器内断言（`frontend/scripts/verify_continue_seed.ts`，跑法见文件头注释）。
 - **锁定零上传**：锁 `Take A` 期间 `/api/assets` 请求数为 **0**（候选本身就是 `/static` 地址），
   自动切到下一段；四条候选的 WAV 由 wavesurfer 直接从 `/static/output/` 取回 200。
 - **缓存命中**：第二段两个任务都回 `source=cache`，**GET 增量 0**，进度条写
