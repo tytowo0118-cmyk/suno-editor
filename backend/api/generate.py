@@ -57,7 +57,13 @@ UPSTREAM_LOG_LIMIT = 3000
 # 提交是扣费操作，只有「请求还没离开本机」的失败才允许重试：建单前的连接/连接池超时重复提交不会多扣费，
 # 而读写超时时上游可能已经建单，重试就是再花一次钱，所以这些一律直接失败。
 PRE_SEND_ERRORS = (httpx.ConnectTimeout, httpx.ConnectError, httpx.PoolTimeout)
-SUBMIT_RETRY_DELAYS = (1.0, 3.0)
+# 退避到 8s 为止共 4 次尝试。本机链路走 TUN 代理（fake-IP），掐断来自代理向源站拨号的
+# dial 超时（实测约 5s，早于 httpx 的 connect=10s，所以失败长这样：
+# `ConnectError after 5.04s` 而不是 `ConnectTimeout after 10s`）。这种掐是瞬时的：
+# 2026-11-11 02:25 连续 3 次都在 5.0s 被掐，而同一容器 02:17 还成功过、事后 21/21 轮握手
+# 1.28–1.59s 全通。pre-send 重试不扣费，多给一次长退避正好治这个窗口，代价只是最坏情况
+# 多等 8s（总耗时 3×5s 尝试 + 1+3+8 退避 ≈ 27s）。
+SUBMIT_RETRY_DELAYS = (1.0, 3.0, 8.0)
 
 # 轮询和下载都是幂等 GET：既不建单也不扣费，所以传输层失败和上游 5xx / 429 能安全重试。
 # 一次网络抖动就作废整条已经扣费的任务，损失远大于多等几秒。
@@ -358,9 +364,13 @@ async def _post_submit(
 ) -> httpx.Response:
     """提交建单，只对建单前的连接失败退避重试。
 
-    一段 3 候选是并发提交的，上游网关忙时接入队列会排队，握手在 connect 超时（10s）内没完成
-    就抛 ConnectTimeout；这类请求根本没发出去，重试是安全的。读写超时时字节可能已经到达上游，
-    重试等于再扣一次费，因此不重试，直接把异常类名和耗时摊到错误信息里。
+    上游网关忙时接入队列会排队，握手迟迟完不成；这类失败请求根本没离开本机，重试是安全的、也不扣费。
+    读写超时时字节可能已经到达上游，重试等于再扣一次费，因此不重试，直接把异常类名和耗时摊到
+    错误信息里。
+    失败形态不止一种，所以日志把 `repr(exc)` 也打上：本机走 TUN 代理（fake-IP）时，代理向源站
+    拨号的 dial 超时（实测约 5s）比 httpx 的 connect 超时（10s）先到，抛的是 `ConnectError`
+    而不是 `ConnectTimeout`；底层到底是 SSLEOFError、ECONNRESET 还是 gaierror，
+    只有 `repr(exc)` 那句能分辨（`SUNO_VERBOSE_LOG=0` 时上游原文不落盘）。
     """
     total_started = time.perf_counter()
     for attempt in range(len(SUBMIT_RETRY_DELAYS) + 1):
@@ -379,12 +389,13 @@ async def _post_submit(
                 ) from exc
             delay = SUBMIT_RETRY_DELAYS[attempt]
             logger.warning(
-                "suno submit pre-send failure: %s after %.2fs, retry %d/%d in %.1fs",
+                "suno submit pre-send failure: %s after %.2fs, retry %d/%d in %.1fs | cause=%r",
                 type(exc).__name__,
                 elapsed,
                 attempt + 1,
                 len(SUBMIT_RETRY_DELAYS),
                 delay,
+                exc,
             )
             await asyncio.sleep(delay)
         except httpx.HTTPError as exc:

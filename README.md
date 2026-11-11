@@ -94,6 +94,8 @@ Suno 由后端代理调用，浏览器不再直连模型服务，也无需处理
 │   ├── scripts/
 │   │   ├── calibrate_structure.py # 零成本标定：本地重拼出毫秒真值，给两个检测器同一把尺子打分
 │   │   ├── bench_structure_threads.py # 分析容器线程配比与耗时基准
+│   │   ├── probe_trim_window_hits.py # 零成本扩样：裁短放宽窗在全部已扣费素材上的命中率
+│   │   ├── probe_upstream_reach.py  # 零成本分层探针：DNS/TCP/TLS/HTTP 哪一层把上游掐了
 │   │   └── verify_generate_ledger.py # 零成本验证：假 Suno 上游 + 沙箱账本，27 项断言覆盖全部计费分支
 │   ├── vendor/madmom/models/     # madmom@main 缺失的 models 包替身（见 3.4 依赖表）
 │   ├── data/                     # 运行时状态：clip_id 索引 + 扣费账本（gitignore）+ 标定清单（提交）
@@ -189,7 +191,8 @@ curl -X POST http://127.0.0.1:8000/api/lyrics \
   内返回，而同一发请求重打能通 —— 用**假 key** 打真网关（上游回 401，零扣费）连打 4 发：
   3 发在 1.47~1.49 s 正常到达上游，第 4 发 0.59 s 被掐、重试后 3.08 s 拿到同样的 401。
   按这个单次 ~1/4 的抖动率，三次尝试后失败概率降到 ~1.6%。耗尽重试的 502 文案除了异常类名
-  还带异常原文（截断 90 字符）、尝试次数与总耗时，能一眼分清是握手被掐还是 DNS 坏了。
+  还带异常原文（截断 90 字符）、尝试次数与总耗时，能一眼分清是握手被掐还是 DNS 坏了；
+  重试途中的 WARNING 行 2026-11-11 起也带 `| cause=%r`（与建单那条对齐），不用等打满才看见原因。
   零成本验证：成功路径无额外延时（打本地假服务 0.047 s），连接被拒路径打满 3 次、4.02 s 返回。
 - 提示词要求常用结构 `[Intro] → [Verse 1] → [Chorus] → [Verse 2] → [Chorus] → [Bridge] → [Outro]`；
   实际段落以 LLM 输出为准，前端按标签解析，不做强制改写。
@@ -381,13 +384,31 @@ curl -X POST http://127.0.0.1:8000/api/generate \
    - **上游没有任何时长字段可喂**：文档里既没有 `duration / custom_duration / max_duration`，
      成功响应也只有 `submit_time / start_time / finish_time / metadata.duration`（整体时长，
      没有逐词时间戳），所以「这一段要 8 秒」只能在拼接侧兑现，见 §2.5 的 `max_duration_sec`。
-   - **建单前的退避重试**（`_post_submit`）：一段的多次任务建单是并发提交的，上游网关忙时接入队列会排队，
-     TCP/TLS 握手在 `connect=10s` 内完不成抛 `ConnectTimeout`（实测口径是当时每段 3 并发：1 条进、
-     2 条在 10.01s / 10.016s 整点失败；现在每段并发 2 条，压力更小但判据与重试参数不变）。
-     这类请求的字节还没离开本机，重试不会重复建单扣费，因此按 1s、3s 退避最多再试
-     2 次（最坏 3 次尝试 / 约 34s）；`ReadTimeout`、`WriteTimeout` 等「可能已经送达上游」的失败**一律不重试**，
+   - **建单前的退避重试**（`_post_submit`）：前端一段的多个任务是并发提交的（`Promise.allSettled`），
+     上游网关忙时接入队列会排队，TCP/TLS 握手在 `connect=10s` 内完不成抛 `ConnectTimeout`
+     （实测口径是当时每段 3 并发：1 条进、2 条在 10.01s / 10.016s 整点失败；现在每段只发 1 个任务、
+     一次拿 2 条双生，建单不再并发，但判据不变）。
+     这类请求的字节还没离开本机，重试不会重复建单扣费，因此按 **1s、3s、8s 退避最多再试
+     3 次（共 4 次尝试）**；`ReadTimeout`、`WriteTimeout` 等「可能已经送达上游」的失败**一律不重试**，
      直接 502。异常类名与耗时都写进日志和 `detail`——httpx 的超时异常 `str()` 是空串，
      此前 502 文案只剩一个光秃秃的冒号，看不出卡在哪个阶段。
+     2026-11-11 又补了一条：WARNING 行末尾带 `| cause=%r`，因为**同一句「无法连接 Suno 代理」
+     底下可能是三种完全不同的断法**（代理 dial 超时、TLS 被掐、DNS 挂了），只看类名分不出来。
+   - **为什么退避要放到 8s**：本机链路走 TUN 代理（`key.34ku.com` → fake-IP `198.18.1.49`，
+     系统代理 `127.0.0.1:7890`，默认路由 `198.18.0.1/utun5`），TCP connect 恒 1–9 ms
+     （fake-IP 由 TUN 驱动本地接受），真正决定成败的是代理向源站拨号那一段。
+     实测 02:25 那次连打三次都在 **5.02 / 5.04s 被从下面掐断**（早于 httpx 的 `connect=10s`，
+     所以抛的是 `ConnectError` 而不是 `ConnectTimeout`，异常原文是 `ConnectError('All connection
+     attempts failed')`），而 02:17 同一容器还成功过、事后 21/21 轮握手 1.28–1.59s 全通 ——
+     这是**秒级窗口**的抖动，1s/3s 的短退避正好落在同一个坏窗口里，多给一次 8s 才可能等到恢复。
+     最坏耗时：每次按 5s 被掐 ≈ 20s + 12s 退避 = 32s；每次跑满 10s connect 超时 ≈ 40s + 12s = 52s。
+     判据与花费都用零成本方式验过：把 base 指到本机死端口 `127.0.0.1:1`（refused 属 pre-send，
+     不碰上游）实跑 → 4 次尝试、总 12.05s（= 退避 1+3+8，refused 本身瞬时）、
+     三行 WARNING 都带 `cause=`、`detail` 变成「尝试 4 次 / 12.1s」。
+     分层定位用 `backend/scripts/probe_upstream_reach.py`（只测 DNS/TCP/TLS，`--http` 再补一发
+     无凭据 GET 根路径；不打 `/suno/submit/music`，不建单不扣费）。
+     那一次**没有花钱**：日志 `task=-`、账本 sha 与 mtime 逐位未变，所以重试是正常首次计费，
+     不是免费重查。
 3. **轮询**：每 `SUNO_POLL_INTERVAL` 秒（默认 5）请求 `GET {SUNO_API_BASE}/suno/fetch/{task_id}`，
    直到 `status` 为 `COMPLETE` / `SUCCESS` 并拿到落定片段的 `audio_url`；`FAILED` / `ERROR` 立即失败，
    超过 `SUNO_TIMEOUT`（默认 300s）返回 504。解析函数 `_fetch_state` 返回
@@ -441,8 +462,14 @@ curl -X POST http://127.0.0.1:8000/api/generate \
      （建单 2.5s、出成品 31.8s、下载转码 6.0s，`transient failure` 日志 0 条），
      所以重试必须靠上面两种注入才能验到。
    - 重试发生时会打 WARNING，联调按这几个前缀 grep：`suno submit pre-send failure`、
+     `lyrics LLM pre-send failure`、
      `suno fetch <task_id> transient failure` / `suno fetch <task_id> upstream HTTP`、
      `suno download <文件名> transient failure` / `suno download <文件名> upstream HTTP`。
+     两条 pre-send 的行尾都带 `| cause=<异常原文>`，光 grep 就能分清是 TLS 被掐
+     （`SSLEOFError` / `UNEXPECTED_EOF_WHILE_READING`）、代理 dial 超时
+     （`ConnectError('All connection attempts failed')`）还是 DNS 坏了（`gaierror`）。
+     要再往下定位是哪一层断的，用 `docker exec -i museblocks-backend python
+     /app/scripts/probe_upstream_reach.py --http`（零成本，不发业务请求）。
 
 | 环境变量 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- |
@@ -657,6 +684,28 @@ curl -X POST http://127.0.0.1:8000/api/assets \
   结论要如实说：纯氛围铺底的前奏在开头十几秒内没有可切的边界，放宽窗口对这类素材是 no-op，
   它只在素材本身有乐句切换时才起作用 —— 不会因为远处有边界就把前奏留成 83 s，
   也不会凭空造出一个切点。
+- 2026-11-11 把 `static/output` 里**全部 22 条已扣费 clip**（35.2–205.6 s，含上一轮那两条前奏）
+  按同一口径离线扫了一遍，命中率就这么低，但这就是真实数字：
+
+  | 目标 | 放宽窗命中 | 旧口径（±0.5 s）命中 | 窗内候选数 |
+  | --- | --- | --- | --- |
+  | 8 s | 2/22 = 9.1%（near 1 + wide 1） | 1/22 = 4.5% | median 0，max 1 |
+  | 12 s | 1/22 = 4.5%（wide 1） | 0/22 = 0% | median 0，max 1 |
+
+  放宽只多切到 1–2 刀（`suno_1793677292_700f18_1` 8 s → 6.763 s、`suno_1793586494_72c3c7`
+  12 s → 11.384 s）。提前量按目标分别看：8 s 是 1.237 s 与 0.297 s（后者两档都会切），
+  12 s 是 0.616 s —— 三个命中合起来的 median 才是 0.616 s、max 1.237 s。
+  更要紧的是：账本里标 `instrumental: true` 的素材只有那两条前奏，它们**窗内 0 候选**，
+  也就是这条路径真正面向的器乐人群实测命中率是 0/2。
+  所以它的定位是「零风险、低频次的改进」，不是主力机制 —— 不触发就原样裁到规划秒数，
+  触发时切点一定更短、绝不越上限。真正会命中的场景是素材内部本来就有段落切换
+  （比如裁一条已拼好的多段成品，见上表 18.5 s → 16.945 s）。
+- 左边界不要再放宽了，有实测反例：`suno_1793678609_3932bd` 在 3.280/0.114、4.290/0.228、
+  5.300/0.099 有三条候选，最强那条落在 4.290 s —— 窗一旦放宽到规划的 50%（`[4, 8]`），
+  8 s 前奏会被切成 4.29 s，砍掉将近一半内容。另外一批候选正好卡在 1.991 s，
+  那是 `novelty_curve` 第一个可取块的位置（探测分辨率下限，不是乐句边界），
+  它们左侧 RMS 比右侧高 3–5 dB 或低 6 dB，方向都不一致，说明这类点没有音乐语义。
+  25% + 封顶 4 s 是现有证据下的合理停止点。
 
 - 输出名按**实际保留**的毫秒数（`_trim6461ms.wav`），同一源 + 同一目标重复调用幂等；
   原片本来就不超限时返回原地址、`trimmed=false`，不写新文件；

@@ -288,12 +288,13 @@ async def _post_chat_completions(base: str, key: str, payload: dict) -> httpx.Re
                         ),
                     ) from exc
                 logger.warning(
-                    "lyrics LLM pre-send failure: %s after %.2fs, retry %d/%d in %.1fs",
+                    "lyrics LLM pre-send failure: %s after %.2fs, retry %d/%d in %.1fs | cause=%r",
                     type(exc).__name__,
                     time.perf_counter() - attempt_started,
                     attempt + 1,
                     len(LLM_RETRY_DELAYS),
                     LLM_RETRY_DELAYS[attempt],
+                    exc,
                 )
                 await asyncio.sleep(LLM_RETRY_DELAYS[attempt])
             except httpx.HTTPError as exc:
