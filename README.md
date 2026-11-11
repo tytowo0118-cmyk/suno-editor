@@ -95,6 +95,7 @@ Suno 由后端代理调用，浏览器不再直连模型服务，也无需处理
 │   │   ├── calibrate_structure.py # 零成本标定：本地重拼出毫秒真值，给两个检测器同一把尺子打分
 │   │   ├── bench_structure_threads.py # 分析容器线程配比与耗时基准
 │   │   ├── probe_trim_window_hits.py # 零成本扩样：裁短放宽窗在全部已扣费素材上的命中率
+│   │   ├── probe_seam_continuity.py # 零成本对照：续写接缝 vs 独立接缝的声学连续性（新颖度/调性/RMS/能量洞）
 │   │   ├── probe_upstream_reach.py  # 零成本分层探针：DNS/TCP/TLS/HTTP 哪一层把上游掐了
 │   │   └── verify_generate_ledger.py # 零成本验证：假 Suno 上游 + 沙箱账本，27 项断言覆盖全部计费分支
 │   ├── vendor/madmom/models/     # madmom@main 缺失的 models 包替身（见 3.4 依赖表）
@@ -391,6 +392,8 @@ curl -X POST http://127.0.0.1:8000/api/generate \
         并如实提示**，绝不假装接上了 —— 断链是拼接后听得出来的。
      载荷多这两个字段不额外花钱：建单次数与 `max_clips` 都不变，而 `fingerprint(payload)`
      哈希全部创作字段（只排 transport 字段），续写与独立生成天然是两条账本条目。
+     真实链路已复核（1 次扣费）：接缝处谱形状新颖度 0.0166 vs 独立素材 0.1545 / 0.1175，
+     表与判读见「前端（真实 UI）」里的**逐段续写真实链路**。
    - **模型版本字段名是 `mv` 不是 `model`**：网关的 `/suno/submit/music` 文档字段表只有
      `prompt / mv / title / tags / make_instrumental / task_id / continue_at / continue_clip_id /
      gpt_description_prompt / notify_hook`，`mv` 取 `chirp-v3-0 / chirp-v3-5 / chirp-v4`。
@@ -1021,6 +1024,49 @@ info 档 3.2 s 就消失」的观察窗口。下面这批前端实测录于**每
   两次都是 `blocked=[]`，事后核对花费：近 12 分钟后端 `payload prepared` 日志 **0 条**、
   `static/output` 新增 **0 个**文件、账本 sha `c137fe3a…0780` 与 mtime 逐位未变 —— 没花钱。
   换算口径另有 14 项容器内断言（`frontend/scripts/verify_continue_seed.ts`，跑法见文件头注释）。
+- **逐段续写真实链路（2026-11-11 实测，1 次扣费）**：真实 UI 跑「前奏 + 主歌 1（2 行歌词）」两段。
+  第 1 段命中账本（`fp=14b24397f673`）→ 只有 **1 个 GET**、**0 次建单**，两条候选本地裁到 8.0s；
+  锁 `Take A`（`clip_id=95c73eba…`）后第 2 段发 1 个 POST，body 带
+  `continue_clip_id=95c73eba…` / `continue_at=8`，后端打 `suno continue: clip=… at=8.0`，
+  上游 **58.6 s** 回 2 条（`44.232 / 48.696 s`），`task_lWlnzWJB9c3bRSzr…`、`fp=e7ff410803a2`、
+  账本 2 → 3 条。整轮 `POST /suno/submit/music` **1 条**、`suno task submitted` **1 行**
+  = 只扣一次费。拼接成品 51.823s / peak −3.3 dBFS。
+  **续写点与硬切点是同一个点**：`continue_at=8.0` 对成品里的接缝 `segment_start_sec[1]=7.992`
+  （= 8.0 − 8 ms 交叉淡化），即上游听见的最后一个采样位置正是本地刀口所在。
+  接缝指标（零成本重拼对照：第一段素材与切点不动，只把第二段换成**早前已扣费的独立生成**片段，
+  同判据、同一条 `/api/stitch` 路径；探针 `backend/scripts/probe_seam_continuity.py`，
+  跑法与全部口径写在文件头，**同一批数字连跑三遍逐位复现**）：
+
+  | 接缝处指标 | 续写 | 独立 A | 独立 B |
+  | --- | --- | --- | --- |
+  | 谱形状新颖度 `nov_at`（shipped 检测器） | **0.0166** | 0.1545 | 0.1175 |
+  | 该值在全曲的新颖度分位 | **59.6 %** | 96.3 % | 96.7 % |
+  | 素材级交接余弦 `head_cos`（各自第一个有声帧对齐） | **0.983** | 0.867 | 0.895 |
+  | 成品里接缝前后 200 ms 谱形状余弦 `timbre` | **0.945** | −0.309 | −0.001 |
+  | 12 音级分布余弦 `pcp_cos`（调性维度） | **0.671** | 0.291 | 0.485 |
+  | 前后 150 ms RMS 落差（正=后段更轻） | **−0.84 dB** | +15.30 dB | +15.61 dB |
+  | 接缝后到最近 ≥−20 dBFS 帧的「洞」 | **0.05 s** | 1.10 s | 0.40 s |
+  | 上一段素材在下一段里的最大相关 `replay` | 0.294 | 0.137 | 0.137 |
+
+  判读：按本项目自己的门控 `DEFAULT_FLOOR=0.09`，两条独立接缝都会被边界检测器**认成一个段边界**，
+  续写接缝（0.0166，只等于全曲中位 0.0134 的水平）不会 —— 接缝不再是「换了一首歌」。
+  `0.294 « 1` 说明上游把种子当上下文延续而不是重放前奏。
+  限定：只有 1 段 1 接缝（n=1），对照组是**另一句歌词**的素材，所以「1.10 s 洞」里混着拼接侧
+  −50 dBFS 首静音判据偏松的成分（该片段头 0.5 s 落在 −20 ~ −50 dBFS 之间，只剔掉 0.013 s），
+  收紧阈值也能压掉这一段；不受拼接侧影响的是 `head_cos` 那一行。
+  调性只有连续量 `pcp_cos` 可看：同一批数据的「主音漂移半音数」（续写 7、独立 1 / 6）与
+  「前 5 音级重合数」（3 / 1 / 4）互相矛盾 —— 无词前奏本身没有稳定调中心，单帧峰判定撑不起
+  「漂了 7 个半音」这种读法，正式探针已把这两个离散量删掉。**节奏类指标整类不采信**：
+  谱通量起止点密度 158–215 个 / 52–65 s（≈3 个/秒）远超节拍量级，外推网格的相位误差
+  （−1012 / +462 / −827 ms）是探测器噪声，同样已从探针删除。
+  三条对照成品留着听感 A/B（全部零成本重拼，同一参数连跑三遍逐位复现）：
+  续写 `seamprobe-ext-suno_1794369441_d563_1794370835_prev.wav`（sha256 前 14 位
+  `7a84124f5d6b8c`，与 UI 成品 `museblocks-mix_1794369482_intro-1.wav` **逐位一致**
+  ⇒ 量的就是耳朵听到的那条）、独立 A `seamprobe-ind-suno_1794366599_fabd_1794370836_prev.wav`
+  （`fc79945758cb12`）、独立 B `seamprobe-ind-suno_1794366593_e3a8_1794370836_prev.wav`
+  （`27baafd8a09eff`）。
+  审计口径提醒：一段真实建单会打 **2 行** `suno payload prepared`
+  （`build_payload` 在算指纹与建单时各调一次），数建单次数要以 `suno task submitted` 为准。
 - **锁定零上传**：锁 `Take A` 期间 `/api/assets` 请求数为 **0**（候选本身就是 `/static` 地址），
   自动切到下一段；四条候选的 WAV 由 wavesurfer 直接从 `/static/output/` 取回 200。
 - **缓存命中**：第二段两个任务都回 `source=cache`，**GET 增量 0**，进度条写
