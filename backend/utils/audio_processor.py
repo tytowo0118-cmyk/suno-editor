@@ -50,6 +50,11 @@ DEFAULT_PEAK_DBFS = -1.0
 HEAD_TRIM_THRESHOLD_DBFS = -50.0
 # 按时长裁段时，切点允许在目标秒数前后各吸附的窗口；与前端吸附窗同一口径
 CUT_SNAP_SEC = 0.5
+# 生成后裁器乐候选（/api/trim）时，允许切点向「更短」一侧搜索边界候选的余量：
+# 规划秒数的 25%，封顶 4s。只往前找、不往后延 —— max_duration_sec 是上限，
+# 拼接侧仍按 ±CUT_SNAP_SEC 兑现。8s 前奏 → 在 [6, 8] 内贴最近的候选。
+TRIM_SEARCH_RATIO = 0.25
+TRIM_SEARCH_MAX_SEC = 4.0
 MAX_DOWNLOAD_BYTES = 60 * 1024 * 1024
 
 DEFAULT_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -221,6 +226,9 @@ def _truncate_to_length(
     sample_rate: int,
     max_sec: Optional[float],
     snap_sec: float = CUT_SNAP_SEC,
+    *,
+    before_sec: Optional[float] = None,
+    after_sec: Optional[float] = None,
 ) -> Tuple[np.ndarray, Optional[float], bool]:
     """超长素材物理截到 max_sec，切点优先吸附到结构边界候选。
 
@@ -229,11 +237,17 @@ def _truncate_to_length(
     task_id / continue_at / continue_clip_id / gpt_description_prompt / notify_hook），
     纯器乐 + 空歌词上游一律写满一整首，实测 177~193s。
 
-    切点不硬停在 max_sec 上：先在该点前后 `snap_sec` 内取最近的谱形状新颖度候选 ——
-    候选的定位精度实测 MAE 0.062s（floor 0.09 / gap 1.0s，见 README 检测器标定），
-    比按秒表瞎切可靠；窗内没有候选就回到 max_sec 本身。代价是切点可能比目标长 ≤0.5s。
+    切点不硬停在 max_sec 上：在 `[max_sec − before_sec, max_sec + after_sec]` 内找
+    谱形状新颖度候选 —— 候选的定位精度实测 MAE 0.062s（floor 0.09 / gap 1.0s，见 README
+    检测器标定），比按秒表瞎切可靠；窗内没有候选就回到 max_sec 本身。
+    选取分两档：先看 `±snap_sec` 精确窗内有没有候选，有就取最近的（拼接侧原口径）；
+    没有才在放宽窗内按**谱新颖度强度**取最强的一个 —— 实测合成素材里真边界 6.461s
+    (0.392) 旁边还有一个 7.471s (0.105) 的弱回声，按「离 8s 最近」会选中回声，
+    按强度才会回到真边界。强度相同时再比距离。
+    默认两翼都是 `snap_sec`，与旧行为逐位一致；生成后裁器乐时 `after_sec=0`、
+    `before_sec` 放宽到规划的 25%（见 `trim_search_sec`），只往更短一侧贴，绝不超过上限。
 
-    只探测 `max_sec + snap_sec + max(WINDOW_SEC, GUARD_SEC)` 这一段：候选出不了这个范围，
+    只探测 `max_sec + after_sec + max(WINDOW_SEC, GUARD_SEC)` 这一段：候选出不了这个范围，
     全曲扫描是白花时间（检测器实测 182.378s 整首要 787.5ms，9.5s 探针只要 13.1ms）。
     探针右边界必须让出 WINDOW_SEC：`novelty_curve` 的 `index <= total - window_frames`
     要求切点右侧凑满一整个 2s 块，只让 GUARD_SEC 会把窗口右半边的候选全吃掉 ——
@@ -248,33 +262,51 @@ def _truncate_to_length(
     if samples.shape[0] <= limit_samples:
         return samples, None, False
 
+    before = snap_sec if before_sec is None else before_sec
+    after = snap_sec if after_sec is None else after_sec
     probe_end = min(
         samples.shape[0],
         limit_samples
         + int(
             round(
-                (snap_sec + max(structure_detector.WINDOW_SEC, structure_detector.GUARD_SEC))
+                (after + max(structure_detector.WINDOW_SEC, structure_detector.GUARD_SEC))
                 * sample_rate
             )
         ),
     )
     candidates = structure_detector.boundary_candidates(samples[:probe_end], sample_rate)
-    nearby = [moment for moment, _ in candidates if abs(moment - max_sec) <= snap_sec]
-    snapped = bool(nearby)
-    cut_sec = min(nearby, key=lambda moment: abs(moment - max_sec)) if snapped else max_sec
-    kept = min(max(int(round(cut_sec * sample_rate)), 1), samples.shape[0])
+    low = max_sec - before - 1e-9
+    high = max_sec + after + 1e-9
+    in_window = [(moment, strength) for moment, strength in candidates if low <= moment <= high]
+    nearby = [(moment, strength) for moment, strength in in_window if abs(moment - max_sec) <= snap_sec]
+    if nearby:
+        picked, picked_strength = min(nearby, key=lambda item: abs(item[0] - max_sec))
+        pick = "near"
+    elif in_window:
+        picked, picked_strength = max(
+            in_window, key=lambda item: (item[1], -abs(item[0] - max_sec))
+        )
+        pick = "wide"
+    else:
+        picked, picked_strength, pick = max_sec, 0.0, "none"
+    snapped = pick != "none"
+    kept = min(max(int(round(picked * sample_rate)), 1), samples.shape[0])
     if kept >= samples.shape[0]:
         return samples, None, False
     logger.info(
-        "duration_truncated: kept=%.3fs target=%.3fs cut=%.3fs snapped=%s discarded=%.3fs "
-        "(probe=%.3fs candidates=%d)",
+        "duration_truncated: kept=%.3fs target=%.3fs cut=%.3fs snapped=%s pick=%s "
+        "strength=%.3f discarded=%.3fs (probe=%.3fs candidates=%d window=[%.3f,%.3f])",
         kept / float(sample_rate),
         max_sec,
-        cut_sec,
+        picked,
         snapped,
+        pick,
+        picked_strength,
         (samples.shape[0] - kept) / float(sample_rate),
         probe_end / float(sample_rate),
         len(candidates),
+        max_sec - before,
+        max_sec + after,
     )
     return samples[:kept], round(kept / float(sample_rate), 3), snapped
 
@@ -310,6 +342,15 @@ def _write_wav(path: Path, samples: np.ndarray, frame_rate: int) -> None:
         handle.writeframes(pcm.tobytes())
 
 
+def trim_search_sec(max_sec: float) -> float:
+    """生成后裁器乐时向更短一侧找边界候选的窗口：规划秒数的 25%，封顶 4s。
+
+    8s 前奏 → 2s（在 [6, 8] 里找，±0.5s 内最近、否则最强）；12s 空格 → 3s；≥16s 一律 4s。
+    下限取 `CUT_SNAP_SEC`，避免极短目标把窗口缩到检测器分辨率以下。
+    """
+    return max(CUT_SNAP_SEC, min(TRIM_SEARCH_MAX_SEC, max_sec * TRIM_SEARCH_RATIO))
+
+
 def trim_clip_to_seconds(
     source: str,
     max_sec: float,
@@ -322,24 +363,38 @@ def trim_clip_to_seconds(
     （实测 205.560 / 189.504 s）；不裁的话候选卡与时间轴都按整首展开，
     用户看到的「前奏」其实是整首歌，直到拼接时才被 `max_duration_sec` 砍到 8 s。
 
-    与拼接侧同一套裁切口径：先剔尾部数字静音，再在目标秒数 ±`CUT_SNAP_SEC`
-    内吸附结构候选；窗内没有候选就硬停在目标秒数。2026-11-09 对两条前奏素材实测：
-    前 90 s 内检测器只给出 83.4 s 一个候选，8 s 目标窗内没有，裁出就是 8.000 s。
+    裁切口径：先剔尾部数字静音，再在 `[max_sec − trim_search_sec(max_sec), max_sec]`
+    内找结构候选 —— 规划秒数是个粗估值，附近 25%（封顶 4s）内有真实乐句边界时
+    让边界决定切点；没有就硬停在 max_sec。
+    ±0.5s 精确窗内有候选取最近的，否则取窗内谱新颖度最强的（理由见 `_truncate_to_length`），
+    避免被切点附近的弱回声骗走。只往更短一侧找，绝不越过上限，
+    因此拼接侧 `max_duration_sec` 对裁过的候选是无操作。
+    2026-11-09 对两条前奏素材实测：前 90 s 内只给出 83.4 s 一个候选，[6, 8] 窗内没有，
+    裁出仍是 8.000 s（`snapped=false`）—— 83 s 处的边界不会把前奏留成 83 s。
+
+    输出名按**实际保留**的毫秒数生成（`_trim7200ms.wav`），吸附到更短的候选时名字跟着变；
+    同一源 + 同一目标重复调用得到同一文件名，幂等。
+    原片本来就没超限时不写新文件，返回原路径与原始时长。
 
     Returns:
-        (输出路径, 原始时长, 保留时长, 切点是否吸附)；
-        原片本来就没超限时不写新文件，返回原路径与原始时长。
+        (输出路径, 原始时长, 保留时长, 切点是否吸附)
     """
     samples, frame_rate = read_audio(source)
     source_sec = samples.shape[0] / float(frame_rate)
     trimmed, _ = _trim_tail_silence(samples, HEAD_TRIM_THRESHOLD_DBFS)
-    kept, kept_sec, snapped = _truncate_to_length(trimmed, frame_rate, max_sec)
+    kept, kept_sec, snapped = _truncate_to_length(
+        trimmed,
+        frame_rate,
+        max_sec,
+        before_sec=trim_search_sec(max_sec),
+        after_sec=0.0,
+    )
     if kept_sec is None:
         return _resolve_local_path(source), round(source_sec, 3), round(source_sec, 3), False
 
     target_dir = output_dir or OUTPUT_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{Path(source).stem}_trim{int(round(max_sec * 1000))}ms.wav"
+    filename = f"{Path(source).stem}_trim{int(round(kept_sec * 1000))}ms.wav"
     output_path = target_dir / filename
     # 先写临时文件再原子替换：同一源被并发裁两次时不会读到写了一半的 WAV
     temp_path = target_dir / f".{filename}.{os.urandom(4).hex()}.tmp"
@@ -350,10 +405,11 @@ def trim_clip_to_seconds(
         temp_path.unlink(missing_ok=True)
         raise
     logger.info(
-        "clip_trimmed: source=%.3fs kept=%.3fs target=%.3fs snapped=%s file=%s",
+        "clip_trimmed: source=%.3fs kept=%.3fs target=%.3fs search=%.3fs snapped=%s file=%s",
         source_sec,
         kept_sec,
         max_sec,
+        trim_search_sec(max_sec),
         snapped,
         output_path.name,
     )
