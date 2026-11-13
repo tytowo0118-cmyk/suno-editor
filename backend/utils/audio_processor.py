@@ -229,6 +229,7 @@ def _truncate_to_length(
     *,
     before_sec: Optional[float] = None,
     after_sec: Optional[float] = None,
+    beyond_sec: float = 0.0,
 ) -> Tuple[np.ndarray, Optional[float], bool]:
     """超长素材物理截到 max_sec，切点优先吸附到结构边界候选。
 
@@ -240,12 +241,19 @@ def _truncate_to_length(
     切点不硬停在 max_sec 上：在 `[max_sec − before_sec, max_sec + after_sec]` 内找
     谱形状新颖度候选 —— 候选的定位精度实测 MAE 0.062s（floor 0.09 / gap 1.0s，见 README
     检测器标定），比按秒表瞎切可靠；窗内没有候选就回到 max_sec 本身。
-    选取分两档：先看 `±snap_sec` 精确窗内有没有候选，有就取最近的（拼接侧原口径）；
+    选取分三档：先看 `±snap_sec` 精确窗内有没有候选，有就取最近的（拼接侧原口径）；
     没有才在放宽窗内按**谱新颖度强度**取最强的一个 —— 实测合成素材里真边界 6.461s
     (0.392) 旁边还有一个 7.471s (0.105) 的弱回声，按「离 8s 最近」会选中回声，
     按强度才会回到真边界。强度相同时再比距离。
-    默认两翼都是 `snap_sec`，与旧行为逐位一致；生成后裁器乐时 `after_sec=0`、
-    `before_sec` 放宽到规划的 25%（见 `trim_search_sec`），只往更短一侧贴，绝不超过上限。
+    第三档 `beyond` 只在 `beyond_sec > 0` 时启用（有歌词的段落用）：短侧窗里一个候选都没有时
+    **不硬停在 max_sec** —— 唱词比每句 4s 的估算走得慢，硬停会把句子切一半，那是比留长尾更糟的
+    切法（这就是当初有词段不裁的理由）。改为取 `max_sec` 之后**最近**的一个边界，最多往后让
+    `beyond_sec`。这一档按「最近」而非「最强」：要的是本段结束后第一个曲式边界（主歌→副歌），
+    更强的那个往往是再下一段的边界。护栏内仍没有候选才回到 max_sec（`pick=none`）。
+    默认 `beyond_sec=0` ⇒ 行为与旧版逐位一致（无词前奏维持「只往更短、绝不越界」，
+    83s 处的边界不会把 8s 前奏留成 83s）。
+    默认两翼 `before_sec` / `after_sec` 都是 `snap_sec`，与旧行为逐位一致；生成后裁器乐时
+    `after_sec=0`、`before_sec` 放宽到规划的 25%（见 `trim_search_sec`）。
 
     只探测 `max_sec + after_sec + max(WINDOW_SEC, GUARD_SEC)` 这一段：候选出不了这个范围，
     全曲扫描是白花时间（检测器实测 182.378s 整首要 787.5ms，9.5s 探针只要 13.1ms）。
@@ -264,12 +272,13 @@ def _truncate_to_length(
 
     before = snap_sec if before_sec is None else before_sec
     after = snap_sec if after_sec is None else after_sec
+    beyond = max(0.0, beyond_sec)
     probe_end = min(
         samples.shape[0],
         limit_samples
         + int(
             round(
-                (after + max(structure_detector.WINDOW_SEC, structure_detector.GUARD_SEC))
+                (max(after, beyond) + max(structure_detector.WINDOW_SEC, structure_detector.GUARD_SEC))
                 * sample_rate
             )
         ),
@@ -288,14 +297,23 @@ def _truncate_to_length(
         )
         pick = "wide"
     else:
-        picked, picked_strength, pick = max_sec, 0.0, "none"
+        later = [
+            (moment, strength)
+            for moment, strength in candidates
+            if max_sec + 1e-9 < moment <= max_sec + beyond + 1e-9
+        ]
+        if later:
+            picked, picked_strength = min(later, key=lambda item: item[0])
+            pick = "beyond"
+        else:
+            picked, picked_strength, pick = max_sec, 0.0, "none"
     snapped = pick != "none"
     kept = min(max(int(round(picked * sample_rate)), 1), samples.shape[0])
     if kept >= samples.shape[0]:
         return samples, None, False
     logger.info(
         "duration_truncated: kept=%.3fs target=%.3fs cut=%.3fs snapped=%s pick=%s "
-        "strength=%.3f discarded=%.3fs (probe=%.3fs candidates=%d window=[%.3f,%.3f])",
+        "strength=%.3f discarded=%.3fs (probe=%.3fs candidates=%d window=[%.3f,%.3f] beyond=%.3f)",
         kept / float(sample_rate),
         max_sec,
         picked,
@@ -307,6 +325,7 @@ def _truncate_to_length(
         len(candidates),
         max_sec - before,
         max_sec + after,
+        beyond,
     )
     return samples[:kept], round(kept / float(sample_rate), 3), snapped
 
@@ -355,6 +374,7 @@ def trim_clip_to_seconds(
     source: str,
     max_sec: float,
     *,
+    beyond_sec: float = 0.0,
     output_dir: Optional[Path] = None,
 ) -> Tuple[Path, float, float, bool]:
     """把单段音频裁到 `max_sec` 以内并落盘，用于器乐候选生成后的「只留本段」。
@@ -367,8 +387,10 @@ def trim_clip_to_seconds(
     内找结构候选 —— 规划秒数是个粗估值，附近 25%（封顶 4s）内有真实乐句边界时
     让边界决定切点；没有就硬停在 max_sec。
     ±0.5s 精确窗内有候选取最近的，否则取窗内谱新颖度最强的（理由见 `_truncate_to_length`），
-    避免被切点附近的弱回声骗走。只往更短一侧找，绝不越过上限，
+    避免被切点附近的弱回声骗走。默认只往更短一侧找，绝不越过上限，
     因此拼接侧 `max_duration_sec` 对裁过的候选是无操作。
+    `beyond_sec > 0` 时多一档「往后吸」（有歌词的段落用）：短侧窗空手时取 `max_sec` 之后
+    最近的边界，最多让 `beyond_sec` 秒，而不是硬停在估算秒数上把唱词切一半。
     2026-11-09 对两条前奏素材实测：前 90 s 内只给出 83.4 s 一个候选，[6, 8] 窗内没有，
     裁出仍是 8.000 s（`snapped=false`）—— 83 s 处的边界不会把前奏留成 83 s。
 
@@ -388,6 +410,7 @@ def trim_clip_to_seconds(
         max_sec,
         before_sec=trim_search_sec(max_sec),
         after_sec=0.0,
+        beyond_sec=beyond_sec,
     )
     if kept_sec is None:
         return _resolve_local_path(source), round(source_sec, 3), round(source_sec, 3), False
@@ -488,6 +511,7 @@ def stitch_sequence(
     peak_dbfs: float = DEFAULT_PEAK_DBFS,
     head_trim_threshold_dbfs: float = HEAD_TRIM_THRESHOLD_DBFS,
     max_durations: Optional[Sequence[Optional[float]]] = None,
+    beyond_durations: Optional[Sequence[Optional[float]]] = None,
 ) -> Tuple[str, float, float, List[float], List[float], List[float], List[Optional[float]]]:
     """按顺序拼接任意多段音频，每段可指定到下一段的交叉淡化时长。
 
@@ -497,6 +521,8 @@ def stitch_sequence(
         head_trim_threshold_dbfs: 首尾静音裁切的帧能量阈值，默认 -50 dBFS（首段不裁头部片头）
         max_durations: 与 sources 等长的每段保留秒数上限，None 表示不裁；
             切点会吸附到结构边界候选，见 `_truncate_to_length`
+        beyond_durations: 与 sources 等长的每段「往后吸」秒数，None/0 表示不启用该档
+            （有歌词的段落用它，避免短侧窗没候选时硬停在估算秒数上切到唱词中间）
 
     Returns:
         (输出路径, 成品时长秒, 成品峰值 dBFS, 每段在成品中的起点秒数,
@@ -508,10 +534,15 @@ def stitch_sequence(
         raise AudioSourceError("至少需要两段音频才能拼接")
     if max_durations is not None and len(max_durations) != len(sources):
         raise AudioSourceError("max_durations 必须与 segments 等长")
+    if beyond_durations is not None and len(beyond_durations) != len(sources):
+        raise AudioSourceError("beyond_durations 必须与 segments 等长")
 
     temps: List[Path] = []
     frame_rate = SAMPLE_RATE
     limits: List[Optional[float]] = list(max_durations) if max_durations else [None] * len(sources)
+    beyonds: List[float] = (
+        [value or 0.0 for value in beyond_durations] if beyond_durations else [0.0] * len(sources)
+    )
     try:
         mixed: Optional[np.ndarray] = None
         pending_crossfade = 0
@@ -528,7 +559,16 @@ def stitch_sequence(
                 # 首段保留原始片头留白，但尾部静音一样要剔除，否则接缝前留着整段死寂
                 current, trimmed_tail = _trim_tail_silence(current, head_trim_threshold_dbfs)
                 frame_rate = rate
-                current, kept_sec, snapped = _truncate_to_length(current, frame_rate, limits[index])
+                # 与 trim_clip_to_seconds 同一短侧窗口径（25% 放宽、不越上限、beyond 往后吸），
+                # 否则拼接侧补截与生成后裁短会在「窗内有候选」的素材上切出两个不同的点
+                current, kept_sec, snapped = _truncate_to_length(
+                    current,
+                    frame_rate,
+                    limits[index],
+                    before_sec=trim_search_sec(limits[index]) if limits[index] else None,
+                    after_sec=0.0 if limits[index] else None,
+                    beyond_sec=beyonds[index],
+                )
                 tail_trim.append(trimmed_tail / float(frame_rate))
                 truncate_to.append(kept_sec)
                 truncate_snapped.append(snapped)
@@ -556,7 +596,14 @@ def stitch_sequence(
             head_trim.append(trimmed / float(frame_rate))
             current, trimmed_tail = _trim_tail_silence(current, head_trim_threshold_dbfs)
             tail_trim.append(trimmed_tail / float(frame_rate))
-            current, kept_sec, snapped = _truncate_to_length(current, frame_rate, limits[index])
+            current, kept_sec, snapped = _truncate_to_length(
+                current,
+                frame_rate,
+                limits[index],
+                before_sec=trim_search_sec(limits[index]) if limits[index] else None,
+                after_sec=0.0 if limits[index] else None,
+                beyond_sec=beyonds[index],
+            )
             truncate_to.append(kept_sec)
             truncate_snapped.append(snapped)
             if current.shape[0] == 0:

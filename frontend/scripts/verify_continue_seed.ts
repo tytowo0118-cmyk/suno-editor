@@ -11,7 +11,9 @@
  *     && node /tmp/muse-seed/scripts/verify_continue_seed.js'
  * 被测对象是 shipped 源码编译出的函数，不是复刻。全程不碰后端、不建单、不扣费。
  *
- * 规划秒数出自 `plannedTruncateSec`：无词 intro=8s、无词 verse/chorus=12s、有词=不裁。
+ * 规划秒数出自 `plannedTruncateSec`：**每个段落都有**（无词 intro=8s、无词 verse/chorus=12s、
+ * 有词按行数 4n+4 再夹进 [8, 60/40/30]）。`truncateBeyondSec` 决定「还没截成」的上限：
+ * 无词段 0（前奏就该是 8s），有词段等于规划秒数（切点最多到规划的 2 倍）。
  */
 import { continuationSeed } from "../src/lib/musicgen";
 import type { Take, TimelineSection } from "../src/lib/types";
@@ -82,11 +84,12 @@ check(
   { clipId: "clip-ccc", continueAt: 11.384 },
 );
 
-// 4) 有词段落不裁（拼接侧也不裁），听得见的末尾就是整条 clip 的末尾
+// 4) 有词段候选没截成（44.232s 的实测主歌里副歌都唱完了）：34.2 > 规划 12 + 护栏 12，
+//    必须夹回规划秒数，不能在「整首歌写完的地方」续写下一段
 check(
-  "有词段落 → 取整条候选秒数",
+  "有词段候选仍是整条 → 夹回规划秒数",
   continuationSeed(vocal, mkTake(34.2, "clip-ddd")),
-  { clipId: "clip-ddd", continueAt: 34.2 },
+  { clipId: "clip-ddd", continueAt: 12 },
 );
 
 // 5) 上一段没锁定 / 段落不存在：退回独立整首生成，不能假装接上了
@@ -123,9 +126,30 @@ check(
   { clipId: "clip-iii", continueAt: 11.384 },
 );
 check(
-  "有词段浮点尾巴量化",
-  continuationSeed(vocal, mkTake(34.199999999, "clip-jjj")),
-  { clipId: "clip-jjj", continueAt: 34.2 },
+  "有词段浮点尾巴量化（已截到 19.313s 的边界）",
+  continuationSeed(vocal, mkTake(19.312999999, "clip-jjj")),
+  { clipId: "clip-jjj", continueAt: 19.313 },
+);
+
+// 10) 有词段已截到 beyond 档吸住的边界（19.313s，44.232s 主歌 extend 产物的实测截点）：
+//     续写点取截点，绝不拿 12 再裁一次
+check(
+  "有词段已截到吸住的边界 → 取截点",
+  continuationSeed(vocal, mkTake(19.313, "clip-kkk")),
+  { clipId: "clip-kkk", continueAt: 19.313 },
+);
+
+// 11) 「没截成」的判据上限 = 规划 + 护栏 + 0.05（浮点噪声余量）：
+//     压线 24.05 视为已截（保留原秒数），24.06 视为没截成（夹回规划）
+check(
+  "有词段压线 24.05 → 视为已截",
+  continuationSeed(vocal, mkTake(24.05, "clip-lll")),
+  { clipId: "clip-lll", continueAt: 24.05 },
+);
+check(
+  "有词段 24.06 超上限 → 夹回规划秒数",
+  continuationSeed(vocal, mkTake(24.06, "clip-mmm")),
+  { clipId: "clip-mmm", continueAt: 12 },
 );
 
 console.log(`##### continuationSeed: ${passed} PASS / ${failures.length} FAIL #####`);

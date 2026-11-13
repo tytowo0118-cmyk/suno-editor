@@ -189,13 +189,27 @@ function estimateDuration(kind: SectionKind, lyrics: string): number {
   return Math.round(Math.min(max, Math.max(8, seconds)));
 }
 
-/** 无词段落在拼接侧最多保留几秒；有歌词就返回 undefined，不裁。
- *  这类段落发给上游的是 `make_instrumental=true` + 空歌词，Suno 没有时长字段可吃，
- *  一律写满一整首（实测 177~193s），只能靠这个规划秒数在拼接时兑现。
+/** 每个段落在成品里规划保留的秒数 —— **所有段落都要截出自己的那一段**。
+ *  上游没有任何时长字段可吃：空歌词段 `make_instrumental` 会写满整首（实测 205.560 / 189.504 s），
+ *  `extend` 续写回来的也是「本段之后的一切」（实测 2 行主歌给 44.232 s，里面连副歌都唱完了）。
+ *  以前有歌词的段落返回 undefined，理由写在注释里：「段长由唱词决定，裁在乐句中间比留长尾更糟」。
+ *  那是每段独立整首生成时代的口径 —— 改逐段续写之后它等于把后面所有段都算进本段，
+ *  还会让下一段的 `continue_at` 落到「整首歌写完的地方」，段与段就越写越长。
+ *  「不切在句中」现在由后端 `_truncate_to_length` 的 beyond 档兑现：短侧窗没候选就往后吸到
+ *  第一个结构边界（主歌→副歌正是谱新颖度最擅长的那种突变），而不是硬停在估算秒数上。
  *  刻意不读 `section.durationSec`：生成后它会被 applyNaturalDuration 覆写成返回音频的实际长度，
  *  拿 182.6s 去裁 182.6s 的素材等于什么都没做。 */
 export function plannedTruncateSec(section: TimelineSection): number | undefined {
-  return section.lyrics.trim() ? undefined : estimateDuration(section.kind, section.lyrics);
+  return estimateDuration(section.kind, section.lyrics) || undefined;
+}
+
+/** 截点后允许再往后让几秒去找结构边界。
+ *  无词段固定 0：前奏就该是 8s，27.777s 处的边界不能把前奏留成 27s（旧行为逐位不变）。
+ *  有词段给一个规划秒数，等于「切点最多到规划的 2 倍」—— 唱多久无法预知，
+ *  但超出 2 倍还不吸就说明这段素材压根没有段尾边界，留着整条比乱切好。 */
+export function truncateBeyondSec(section: TimelineSection): number {
+  if (!section.lyrics.trim()) return 0;
+  return plannedTruncateSec(section) ?? 0;
 }
 
 function firstLyricLine(lyrics: string): string {

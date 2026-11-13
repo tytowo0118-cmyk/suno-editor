@@ -1,5 +1,5 @@
 import { API_BASE, runGenerateJob, trimAudio } from "./api";
-import { plannedTruncateSec } from "./lyrics";
+import { plannedTruncateSec, truncateBeyondSec } from "./lyrics";
 import type { GenerateJob, GenerateSource, Take, TimelineSection } from "./types";
 
 /** FastAPI 后端的生成任务端点：提交拿 job_id，轮询读阶段进度（旧的同步 /api/generate 仍保留） */
@@ -163,14 +163,18 @@ export function describeGenerateJob(job: GenerateJob): {
 /**
  * 上一段「已锁定候选」换算成本段续写的种子：`continue_clip_id` + `continue_at`。
  *
- * 两个不显然的口径：
+ * 三个不显然的口径：
  * 1. `/api/trim` 只往 `/static` 写新 WAV，**不产 clip_id**（响应里只有 audio_url /
  *    duration / source_duration / snapped），所以续写只能回指上游原片的 clip_id。
- *    好在裁短保留的正是原片 `[0, cut]`，`take.duration` 就是原片时间轴上的续写点，
- *    两者同源，不会出现「本地裁到 8s、上游按 205s 给上下文」的错位。
- * 2. 有歌词的段落不裁（`plannedTruncateSec` 返回 undefined，时长由唱词决定），
- *    听得见的末尾就是整条 clip 的末尾；无词段落按规划秒数裁，拼接侧也是这个口径，
- *    所以裁短失败、候选还躺着 205.6s 整首时，续写点仍取规划秒数，跟着「实际会用到的」走。
+ *    裁短保留的正是原片 `[0, cut]`，`take.duration` 就是原片时间轴上的续写点，
+ *    两处同源，不会出现「本地裁到 8s、上游按 205s 给上下文」的错位。
+ *    续写产物同理：它自己也是一个 clip，下一段拿它的 `clip_id` + 本段截点继续往下接，
+ *    所以链是「逐级延长」而不是一级一回首。
+ * 2. **每一段都截**（`plannedTruncateSec` 现在对有词段也返回秒数），所以续写点默认取
+ *    `take.duration` —— 那是截短实际保留的秒数，含 beyond 档往后吸到的边界。
+ * 3. 截短没成（`/api/trim` 挂了、或恢复的历史现场里躺着整条未裁素材）时不能照抄
+ *    `take.duration`：主歌候选 44.232s 里已经唱完副歌，在它末尾续写等于跳过本段。
+ *    判据用 `pendingTruncateSec`：候选还长过「规划 + 往后吸护栏」就认定没截成，退回规划秒数。
  *
  * 上一段没锁定、候选没有 clip_id（历史现场的 blob 地址）都返回 undefined，
  * 调用方据此退回独立整首生成 —— 必须让调用方知道，续写链断了是听得出来的。
@@ -182,11 +186,27 @@ export function continuationSeed(
   if (!prevSection || !prevTake) return undefined;
   const clipId = prevTake.clipId?.trim();
   if (!clipId) return undefined;
-  const planned = plannedTruncateSec(prevSection);
-  const keepSec = planned ? Math.min(prevTake.duration, planned) : prevTake.duration;
-  if (!Number.isFinite(keepSec) || keepSec <= 0) return undefined;
+  const keepSec =
+    pendingTruncateSec(prevSection, prevTake) ?? (prevTake.duration || undefined);
+  if (!Number.isFinite(keepSec) || !keepSec || keepSec <= 0) return undefined;
   // 上游 continue_at 会 round(_, 3)，这里先量化到毫秒，避免浮点尾巴进载荷和指纹
   return { clipId, continueAt: Math.round(keepSec * 1000) / 1000 };
+}
+
+/**
+ * 本段还需不需要在拼接侧再截一次：候选长度超过「规划 + 往后吸护栏」= 生成后那次截短没成
+ * （接口挂了 / 恢复的历史现场里躺着整条素材）。
+ *
+ * 已经截过的必须返回 undefined —— 拿规划秒数去二次裁会把刚吸到的边界又砍掉一截
+ * （主歌吸到 19.313s，再按 12s 裁就唱到半句就断）。
+ */
+export function pendingTruncateSec(
+  section: TimelineSection,
+  take: Take,
+): number | undefined {
+  const planned = plannedTruncateSec(section);
+  if (!planned) return undefined;
+  return take.duration > planned + truncateBeyondSec(section) + 0.05 ? planned : undefined;
 }
 
 /**
@@ -261,10 +281,11 @@ export async function generateTakes(input: {
 }
 
 /**
- * 器乐段候选的「只留本段」：上游 make_instrumental 不吃时长参数，一条前奏会写满整首
- * （实测 205.560 / 189.504 s）。生成后立刻按规划秒数交给后端裁短，候选卡、锁定、时间轴
- * 与成品才是同一个段长；不裁的话时间轴上会躺着一块 205.6 s 的「前奏」，而拼接时才
- * 被砍到 8 s —— 两处口径对不上。
+ * 候选的「只留本段」：上游不吃任何时长参数 —— 空歌词段 `make_instrumental` 一条前奏写满整首
+ * （实测 205.560 / 189.504 s），`extend` 续写回来的也是本段之后的一切（实测 2 行主歌 44.232 s）。
+ * 生成后立刻按规划秒数交给后端截短，候选卡、锁定、时间轴、下一段的续写点与成品才是同一个段长；
+ * 不截的话时间轴上躺着一块 205.6 s 的「前奏」或 44.2 s 的「主歌」，而拼接时才被砍到规划值 —— 两处口径对不上。
+ * `beyondSec` 让后端在短侧窗没候选时往后吸到第一个结构边界，而不是硬停在估算秒数上切进唱词中间。
  *
  * 裁短失败保留原片（锁定后拼接仍会按 max_duration_sec 裁），把失败数交给调用方提示，
  * 不把「没裁成」伪装成裁好了。
@@ -272,12 +293,13 @@ export async function generateTakes(input: {
 export async function trimTakesToPlan(
   takes: Take[],
   maxDurationSec: number,
+  beyondSec = 0,
 ): Promise<{ takes: Take[]; failed: number }> {
   let failed = 0;
   const trimmed = await Promise.all(
     takes.map(async (take) => {
       try {
-        const result = await trimAudio({ audioUrl: take.audioUrl, maxDurationSec });
+        const result = await trimAudio({ audioUrl: take.audioUrl, maxDurationSec, beyondSec });
         return { ...take, audioUrl: result.audioUrl, duration: result.duration };
       } catch {
         failed += 1;

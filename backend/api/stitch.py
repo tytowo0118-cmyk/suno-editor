@@ -33,6 +33,9 @@ class StitchSegment(BaseModel):
     # 该段在成品里最多保留的秒数。Suno 不吃时长参数，纯器乐段会写满一整首，
     # 由前端把段落的规划时长传进来，后端在静音裁切之后按这段上限裁掉多余尾部
     max_duration_sec: Optional[float] = Field(default=None, gt=0, le=600)
+    # 上限没兑现（候选还是整首/整段续写）时允许往后吸到第一个结构边界的秒数；
+    # 0 = 只往更短一侧并硬停在 max_duration_sec。见 `_truncate_to_length` 的 beyond 档
+    beyond_sec: Optional[float] = Field(default=None, ge=0, le=600)
 
 
 class StitchRequest(BaseModel):
@@ -92,6 +95,7 @@ def stitch_timeline(payload: StitchRequest, request: Request) -> StitchResponse:
             sources,
             output_path=filename,
             max_durations=[seg.max_duration_sec for seg in payload.segments],
+            beyond_durations=[seg.beyond_sec or 0.0 for seg in payload.segments],
         )
     except AudioSourceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -101,6 +101,8 @@ export async function stitchTimeline(segments: Array<{
   crossfadeMs: number;
   /** 本段在成品里最多保留的秒数；不传就整段用完。Suno 不吃时长参数，超长只能在这儿兑现 */
   maxDurationSec?: number;
+  /** 没截成的段在上限附近没边界时，允许往后吸到第一个边界的秒数 */
+  beyondSec?: number;
 }>): Promise<StitchResult> {
   const data = await requestJson<RawStitch>("/api/stitch", {
     method: "POST",
@@ -111,6 +113,7 @@ export async function stitchTimeline(segments: Array<{
         audio_url: segment.audioUrl,
         crossfade_ms: segment.crossfadeMs,
         ...(segment.maxDurationSec ? { max_duration_sec: segment.maxDurationSec } : {}),
+        ...(segment.beyondSec ? { beyond_sec: segment.beyondSec } : {}),
       })),
     }),
   });
@@ -146,12 +149,15 @@ interface RawTrim {
 export async function trimAudio(input: {
   audioUrl: string;
   maxDurationSec: number;
+  /** 短侧窗没候选时允许往后吸到第一个结构边界的秒数；0/不传 = 硬停在 maxDurationSec */
+  beyondSec?: number;
 }): Promise<TrimResult> {
   const data = await requestJson<RawTrim>("/api/trim", {
     method: "POST",
     body: JSON.stringify({
       audio_url: input.audioUrl,
       max_duration_sec: input.maxDurationSec,
+      ...(input.beyondSec ? { beyond_sec: input.beyondSec } : {}),
     }),
   });
   return {

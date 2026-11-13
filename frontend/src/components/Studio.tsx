@@ -10,6 +10,7 @@ import {
   parseLyricBlocks,
   plannedTruncateSec,
   sectionTag,
+  truncateBeyondSec,
 } from "@/lib/lyrics";
 import {
   CANDIDATES_PER_SECTION,
@@ -19,6 +20,7 @@ import {
   continuationSeed,
   describeGenerateJob,
   generateTakes,
+  pendingTruncateSec,
   revokeTakeAudio,
   trimTakesToPlan,
 } from "@/lib/musicgen";
@@ -440,13 +442,16 @@ export default function Studio() {
         return;
       }
 
-      // 器乐段（无歌词）上游写满整首：生成后立刻按规划秒数裁成「只有本段」。
-      // 裁剪走的是后端本地 DSP，不再花钱；失败就保留原片，拼接时仍会按 max_duration_sec 裁。
+      // 每段都只留自己那一段：无词段上游写满整首，有词段 extend 回来的也是「本段之后的一切」
+      // （实测 2 行主歌给 44.232s，副歌都唱完了）。截短走后端本地 DSP，不再花钱；
+      // beyondSec 让有词段在短侧窗没候选时往后吸到第一个结构边界，
+      // 而不是硬停在「每句 4s」的估算上把唱词切一半。截出来的秒数同时是下一段的续写点。
       const plannedSec = plannedTruncateSec(section);
+      const beyondSec = truncateBeyondSec(section);
       let candidates = generated;
       let trimFailed = 0;
       if (plannedSec && generated.length > 0) {
-        const trimmed = await trimTakesToPlan(generated, plannedSec);
+        const trimmed = await trimTakesToPlan(generated, plannedSec, beyondSec);
         candidates = trimmed.takes;
         trimFailed = trimmed.failed;
       }
@@ -466,7 +471,7 @@ export default function Studio() {
       }
       if (trimFailed > 0 && plannedSec) {
         notify(
-          `${trimFailed} 条候选未能裁到规划 ${plannedSec}s，暂时保留整首；锁定后拼接时仍会裁`,
+          `${trimFailed} 条候选未能截到本段（规划 ${plannedSec}s），暂时保留整条；锁定后拼接时仍会截`,
         );
       }
       // 命中账本是「这次没花钱」的好消息，值得一条提示；正常建单不用刷屏，
@@ -682,21 +687,27 @@ export default function Studio() {
     pauseAllAudio();
     try {
       const result = await stitchTimeline(
-        sequence.map(({ section, take }) => ({
-          id: section.id,
-          audioUrl: take.audioUrl,
-          crossfadeMs: CROSSFADE_MS,
-          // 无歌词段（make_instrumental=true）上游会写满一整首，按规划秒数裁到段长；
-          // 有歌词的段落时长由唱词决定，裁在乐句中间比留长尾更糟，所以不裁
-          maxDurationSec: plannedTruncateSec(section),
-        })),
+        sequence.map(({ section, take }) => {
+          // 生成后已经截出本段的，这里必须是 undefined：再拿规划秒数裁一次会把刚吸到的
+          // 边界又砍掉一截（主歌吸到 19.313s，按 12s 裁就唱到半句就断）。
+          // 只有截短没成（/api/trim 挂了、或恢复的历史现场里躺着整条素材）才在拼接侧兜底，
+          // 并带上同样的 beyond 护栏往后吸到结构边界，而不是硬停在每句 4s 的估算上。
+          const fallbackSec = pendingTruncateSec(section, take);
+          return {
+            id: section.id,
+            audioUrl: take.audioUrl,
+            crossfadeMs: CROSSFADE_MS,
+            maxDurationSec: fallbackSec,
+            beyondSec: fallbackSec ? truncateBeyondSec(section) : undefined,
+          };
+        }),
       );
       setMix(result);
       setMixCurrentTime(0);
       const cutCount = result.truncateToSec.filter((sec) => sec != null).length;
       notify(
         `成品已生成：${result.duration.toFixed(2)}s · 峰值 ${result.peakDbfs.toFixed(1)} dBFS` +
-          (cutCount > 0 ? ` · ${cutCount} 个无词段落已裁到规划时长` : ""),
+          (cutCount > 0 ? ` · ${cutCount} 个段落在拼接侧补截到规划时长` : ""),
       );
     } catch (error) {
       notify(error instanceof Error ? `拼接失败：${error.message}` : "拼接失败", "error");

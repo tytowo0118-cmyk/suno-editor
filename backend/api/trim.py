@@ -1,8 +1,10 @@
-"""单段音频裁短接口：把器乐候选在生成后立即裁成「只有本段」。
+"""单段音频裁短接口：把候选在生成后立即截成「只有本段」。
 
-Suno 的 `make_instrumental` 不吃时长参数，空歌词的前奏/尾奏会写满一整首
-（实测 205.560 / 189.504 s）。这条路由只做本地 DSP：读已落盘的 `/static` WAV，
-按规划秒数裁短并写回 `static/output`，不再触发任何扣费请求。
+上游不吃任何时长参数：`make_instrumental` 的空歌词前奏会写满一整首
+（实测 205.560 / 189.504 s），`extend` 续写回来的也是「本段之后的一切」（实测 2 行主歌给 44.232 s）。
+所以每个段落都要在这里截出自己的那一段，截出来的秒数同时是下一段的续写点。
+这条路由只做本地 DSP：读已落盘的 `/static` WAV，按规划秒数裁短并写回 `static/output`，
+不再触发任何扣费请求。
 """
 
 from __future__ import annotations
@@ -29,6 +31,9 @@ class TrimRequest(BaseModel):
     audio_url: str = Field(max_length=2048)
     # 本段在成品/时间轴上规划的秒数，与拼接侧 max_duration_sec 同一口径
     max_duration_sec: float = Field(gt=0, le=600)
+    # 短侧窗没候选时允许往后吸到第一个边界的秒数；0 = 沿用旧行为硬停在 max_duration_sec。
+    # 有歌词的段落用它（每句 4s 只是粗估，硬停会把唱词切一半），无词前奏给 0。
+    beyond_sec: float = Field(default=0.0, ge=0, le=600)
 
 
 class TrimResponse(BaseModel):
@@ -51,7 +56,7 @@ def trim_clip(payload: TrimRequest, request: Request) -> TrimResponse:
 
     try:
         output_path, source_sec, duration, snapped = trim_clip_to_seconds(
-            source, payload.max_duration_sec
+            source, payload.max_duration_sec, beyond_sec=payload.beyond_sec
         )
     except AudioSourceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
